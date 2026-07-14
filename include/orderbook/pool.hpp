@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -46,6 +47,23 @@ class Pool {
         return Capacity;
     }
 
+    // Direct slot access for book-owned intrusive links. This intentionally
+    // bypasses handle validation: the book walks slots it already owns.
+    [[nodiscard]] Order& at(uint32_t slot) noexcept {
+        assert(slot < Capacity);
+        return orders_[slot];
+    }
+    [[nodiscard]] const Order& at(uint32_t slot) const noexcept {
+        assert(slot < Capacity);
+        return orders_[slot];
+    }
+
+    // Full book audits need to prove the allocated/free partition exactly.
+    // Normal book operations should not inspect or mutate the free list head.
+    [[nodiscard]] uint32_t free_head_for_audit() const noexcept {
+        return free_head_;
+    }
+
     // Reserve one free slot and stamp it with the current generational handle.
     // Returns std::nullopt when the fixed pool is exhausted.
     [[nodiscard]] std::optional<Allocation> alloc() noexcept {
@@ -73,6 +91,7 @@ class Pool {
     // fail immediately, and advancing the generation makes the next allocation
     // from this slot produce a different handle.
     void free(uint32_t slot) noexcept {
+        assert(slot < Capacity);
         Order& order = orders_[slot];
         order.handle = 0;
 
@@ -106,6 +125,7 @@ class Pool {
     // Test hook for forcing rare generation states such as uint32_t wraparound.
     // Production code should only change generations through free().
     void set_generation_for_test(uint32_t slot, uint32_t generation) noexcept {
+        assert(slot < Capacity);
         generations_[slot] = generation;
     }
 #endif

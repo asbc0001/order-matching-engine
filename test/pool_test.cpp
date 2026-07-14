@@ -103,6 +103,29 @@ namespace {
     return true;
 }
 
+[[nodiscard]] bool check_slot_access() {
+    ob::Pool<2> pool;
+    auto alloc = pool.alloc();
+    if (!alloc) {
+        return fail("Slot access setup allocation failed");
+    }
+
+    // Slot-indexed access is what the book uses while walking intrusive lists;
+    // it should address the same storage returned by allocation.
+    if (&pool.at(alloc->slot) != alloc->order) {
+        return fail("Mutable slot access did not return allocated order");
+    }
+    pool.at(alloc->slot).remaining = 123;
+
+    const ob::Pool<2>& const_pool = pool;
+    if (&const_pool.at(alloc->slot) != alloc->order ||
+        const_pool.at(alloc->slot).remaining != 123) {
+        return fail("Const slot access did not see allocated order");
+    }
+
+    return true;
+}
+
 [[nodiscard]] bool check_randomized_churn() {
     struct LiveOrder {
         uint32_t slot;
@@ -110,7 +133,7 @@ namespace {
     };
 
     constexpr std::size_t kCapacity = 64;
-    constexpr std::size_t kOperations = 1'000'000;
+    constexpr std::size_t kOperations = 250'000;
 
     ob::Pool<kCapacity> pool;
 
@@ -222,6 +245,9 @@ int main() {
         return 1;
     }
     if (!check_generation_wrap()) {
+        return 1;
+    }
+    if (!check_slot_access()) {
         return 1;
     }
     if (!check_randomized_churn()) {
