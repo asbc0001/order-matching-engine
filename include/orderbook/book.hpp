@@ -183,7 +183,7 @@ class Book {
         assert(idx.has_value());
 
         const Side side = order->side;
-        const uint32_t slot = static_cast<uint32_t>(handle);
+        const uint32_t slot = Pool<PoolCapacity>::slot_of(handle);
         Level& level = levels_[*idx];
 
         unlink(pool_, level, slot);

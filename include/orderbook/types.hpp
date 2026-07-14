@@ -110,6 +110,7 @@ static_assert(std::is_same_v<std::underlying_type_t<Side>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<MsgType>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<EventType>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<RejectReason>, uint8_t>);
+static_assert(std::is_same_v<std::underlying_type_t<EventFlags>, uint8_t>);
 
 static_assert(alignof(InboundMsg) == 64);
 static_assert(alignof(OutboundEvent) == 64);

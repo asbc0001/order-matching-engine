@@ -312,6 +312,76 @@ template <std::size_t Capacity>
     return true;
 }
 
+[[nodiscard]] bool check_book_best_repairs_across_bitmap_words() {
+    ob::Book<ob::config::kFuzz.num_levels, 8> bid_book;
+
+    const auto bid_63 = bid_book.insert(ob::Side::Bid, 63, 10, 1);
+    const auto bid_64 = bid_book.insert(ob::Side::Bid, 64, 10, 2);
+    const auto bid_65 = bid_book.insert(ob::Side::Bid, 65, 10, 3);
+    const auto bid_127 = bid_book.insert(ob::Side::Bid, 127, 10, 4);
+    const auto bid_128 = bid_book.insert(ob::Side::Bid, 128, 10, 5);
+    if (!bid_63 || !bid_64 || !bid_65 || !bid_127 || !bid_128) {
+        return fail("Book word-boundary bid setup failed");
+    }
+
+    // Emptying best bids walks downward across the same 127/128 and 63/64
+    // boundaries the bitmap unit tests cover directly.
+    if (!bid_book.remove(*bid_128) ||
+        !expect_best(bid_book.best_bid_idx(), std::optional<std::size_t>{127},
+                     "Book best bid did not repair from 128 to 127")) {
+        return false;
+    }
+    if (!bid_book.remove(*bid_127) ||
+        !expect_best(bid_book.best_bid_idx(), std::optional<std::size_t>{65},
+                     "Book best bid did not repair from 127 to 65")) {
+        return false;
+    }
+    if (!bid_book.remove(*bid_65) ||
+        !expect_best(bid_book.best_bid_idx(), std::optional<std::size_t>{64},
+                     "Book best bid did not repair from 65 to 64")) {
+        return false;
+    }
+    if (!bid_book.remove(*bid_64) ||
+        !expect_best(bid_book.best_bid_idx(), std::optional<std::size_t>{63},
+                     "Book best bid did not repair from 64 to 63")) {
+        return false;
+    }
+
+    ob::Book<ob::config::kFuzz.num_levels, 8> ask_book;
+    const auto ask_63 = ask_book.insert(ob::Side::Ask, 63, 10, 1);
+    const auto ask_64 = ask_book.insert(ob::Side::Ask, 64, 10, 2);
+    const auto ask_65 = ask_book.insert(ob::Side::Ask, 65, 10, 3);
+    const auto ask_127 = ask_book.insert(ob::Side::Ask, 127, 10, 4);
+    const auto ask_128 = ask_book.insert(ob::Side::Ask, 128, 10, 5);
+    if (!ask_63 || !ask_64 || !ask_65 || !ask_127 || !ask_128) {
+        return fail("Book word-boundary ask setup failed");
+    }
+
+    // Emptying best asks walks upward across those boundaries.
+    if (!ask_book.remove(*ask_63) ||
+        !expect_best(ask_book.best_ask_idx(), std::optional<std::size_t>{64},
+                     "Book best ask did not repair from 63 to 64")) {
+        return false;
+    }
+    if (!ask_book.remove(*ask_64) ||
+        !expect_best(ask_book.best_ask_idx(), std::optional<std::size_t>{65},
+                     "Book best ask did not repair from 64 to 65")) {
+        return false;
+    }
+    if (!ask_book.remove(*ask_65) ||
+        !expect_best(ask_book.best_ask_idx(), std::optional<std::size_t>{127},
+                     "Book best ask did not repair from 65 to 127")) {
+        return false;
+    }
+    if (!ask_book.remove(*ask_127) ||
+        !expect_best(ask_book.best_ask_idx(), std::optional<std::size_t>{128},
+                     "Book best ask did not repair from 127 to 128")) {
+        return false;
+    }
+
+    return bid_book.audit() && ask_book.audit();
+}
+
 [[nodiscard]] bool check_book_edges_and_failures() {
     ob::Book<ob::config::kFuzz.num_levels, 2> book;
     constexpr ob::Price kLastPrice =
@@ -485,6 +555,9 @@ int main() {
         return 1;
     }
     if (!check_book_remove_repairs_best_only_when_needed()) {
+        return 1;
+    }
+    if (!check_book_best_repairs_across_bitmap_words()) {
         return 1;
     }
     if (!check_book_edges_and_failures()) {

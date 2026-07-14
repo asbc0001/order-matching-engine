@@ -47,6 +47,12 @@ class Pool {
         return Capacity;
     }
 
+    // Handles encode the slot in their low 32 bits. Expose that decoding here
+    // so book code does not duplicate the handle layout.
+    [[nodiscard]] static uint32_t slot_of(Handle handle) noexcept {
+        return handle_slot(handle);
+    }
+
     // Direct slot access for book-owned intrusive links. This intentionally
     // bypasses handle validation: the book walks slots it already owns.
     [[nodiscard]] Order& at(uint32_t slot) noexcept {
