@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  format-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check formatting
+        run: |
+          find include src test bench tools -type f \
+            \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null | \
+            xargs -r clang-format --dry-run --Werror
+
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        preset: [debug, release-ci]
+    runs-on: ubuntu-24.04
+    env:
+      CC:  ${{ matrix.compiler == 'gcc' && 'gcc-13'   || 'clang-18' }}
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++-13'    || 'clang++-18' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-13 clang-18
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -j
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
