@@ -5,9 +5,11 @@
 #include <cstdio>
 
 #include "orderbook/config.hpp"
+#include "orderbook/pool.hpp"
 #include "orderbook/types.hpp"
 
 int main() {
+    // Core type and configuration sanity checks.
     // types.hpp's static_asserts already ran at compile time; this is
     // a runtime sanity check so the test actually does something.
     if (ob::NULL_SLOT != 0xFFFFFFFFu) {
@@ -20,6 +22,12 @@ int main() {
     }
     if (ob::Handle{0} != 0) {
         std::fprintf(stderr, "Handle zero-init sanity failed\n");
+        return 1;
+    }
+
+    ob::Pool<4> pool;
+    if (pool.capacity() != 4) {
+        std::fprintf(stderr, "Pool capacity mismatch\n");
         return 1;
     }
 
