@@ -43,30 +43,30 @@ class Pool {
         }
     }
 
-    [[nodiscard]] static constexpr std::size_t capacity() noexcept {
+    static constexpr std::size_t capacity() noexcept {
         return Capacity;
     }
 
     // Handles encode the slot in their low 32 bits. Expose that decoding here
     // so book code does not duplicate the handle layout.
-    [[nodiscard]] static uint32_t slot_of(Handle handle) noexcept {
+    static uint32_t slot_of(Handle handle) noexcept {
         return handle_slot(handle);
     }
 
     // Direct slot access for book-owned intrusive links. This intentionally
     // bypasses handle validation: the book walks slots it already owns.
-    [[nodiscard]] Order& at(uint32_t slot) noexcept {
+    Order& at(uint32_t slot) noexcept {
         assert(slot < Capacity);
         return orders_[slot];
     }
-    [[nodiscard]] const Order& at(uint32_t slot) const noexcept {
+    const Order& at(uint32_t slot) const noexcept {
         assert(slot < Capacity);
         return orders_[slot];
     }
 
     // Full book audits need to prove the allocated/free partition exactly.
     // Normal book operations should not inspect or mutate the free list head.
-    [[nodiscard]] uint32_t free_head_for_audit() const noexcept {
+    uint32_t free_head_for_audit() const noexcept {
         return free_head_;
     }
 
@@ -139,15 +139,15 @@ class Pool {
   private:
     // Handles pack the current slot generation in the high 32 bits and the
     // slot index in the low 32 bits.
-    [[nodiscard]] Handle make_handle(uint32_t slot) const noexcept {
+    Handle make_handle(uint32_t slot) const noexcept {
         return (static_cast<Handle>(generations_[slot]) << 32) | slot;
     }
 
-    [[nodiscard]] static uint32_t handle_slot(Handle handle) noexcept {
+    static uint32_t handle_slot(Handle handle) noexcept {
         return static_cast<uint32_t>(handle);
     }
 
-    [[nodiscard]] bool is_live_handle(Handle handle, uint32_t slot) const noexcept {
+    bool is_live_handle(Handle handle, uint32_t slot) const noexcept {
         return handle != 0 && slot < Capacity && orders_[slot].handle == handle;
     }
 

@@ -8,21 +8,20 @@
 
 namespace {
 
-[[nodiscard]] bool fail(const char* message) {
+bool fail(const char* message) {
     std::fprintf(stderr, "%s\n", message);
     return false;
 }
 
 template <typename T>
-[[nodiscard]] bool expect_eq(std::optional<T> actual, std::optional<T> expected,
-                             const char* message) {
+bool expect_eq(std::optional<T> actual, std::optional<T> expected, const char* message) {
     if (actual != expected) {
         return fail(message);
     }
     return true;
 }
 
-[[nodiscard]] bool check_basic_set_clear_test() {
+bool check_basic_set_clear_test() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
 
     if (bitmap.test(7)) {
@@ -46,7 +45,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] bool check_empty_scans() {
+bool check_empty_scans() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
 
     if (!expect_eq(bitmap.scan_up(0), std::optional<std::size_t>{}, "Empty scan_up at start")) {
@@ -68,7 +67,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] bool check_inclusive_scans() {
+bool check_inclusive_scans() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
     bitmap.set(42);
 
@@ -94,7 +93,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] bool check_word_boundary_scans() {
+bool check_word_boundary_scans() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
 
     // These indices straddle 64-bit word boundaries, where mask direction and
@@ -144,7 +143,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] bool check_band_edges() {
+bool check_band_edges() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
     constexpr std::size_t kLast = ob::config::kFuzz.num_levels - 1;
 
@@ -184,7 +183,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] bool check_sparse_word_skips() {
+bool check_sparse_word_skips() {
     ob::Bitmap<ob::config::kFuzz.num_levels> bitmap;
     constexpr std::size_t kLast = ob::config::kFuzz.num_levels - 1;
 

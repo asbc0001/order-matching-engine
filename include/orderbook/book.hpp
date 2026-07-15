@@ -135,8 +135,28 @@ class Book {
         return PoolCapacity;
     }
 
-    // Structural rest operation only: Phase 3 will wrap this with matching and
-    // event/reject semantics. A null result means the order did not rest.
+    // Convert between external tick prices and compact level indices. The
+    // matcher uses these helpers so it can reason in indices while still
+    // emitting trade events at the actual resting price.
+    static Price index_to_price(std::size_t idx) noexcept {
+        assert(idx < NumLevels);
+        return BasePrice + static_cast<Price>(idx);
+    }
+
+    static std::optional<std::size_t> price_to_index(Price price) noexcept {
+        if (price < BasePrice) {
+            return std::nullopt;
+        }
+
+        const auto idx = static_cast<std::size_t>(price - BasePrice);
+        if (idx >= NumLevels) {
+            return std::nullopt;
+        }
+        return idx;
+    }
+
+    // Structural rest operation only: higher-level matching code will wrap this
+    // with event/reject semantics. A null result means the order did not rest.
     [[nodiscard]] std::optional<Handle> insert(Side side, Price price, Qty qty,
                                                uint64_t client_seq) noexcept {
         const auto idx = price_to_index(price);
@@ -195,6 +215,37 @@ class Book {
         pool_.free(slot);
         assert(check_local(*idx));
         return true;
+    }
+
+    // Matching consumes the oldest order at the best opposite price. Partial
+    // fills only reduce the head order and aggregate quantity; complete fills
+    // unlink and free that head slot, repairing the bitmap/best pointer if the
+    // price level becomes empty.
+    void fill_head(std::size_t idx, Qty fill_qty) noexcept {
+        assert(idx < NumLevels);
+        Level& level = levels_[idx];
+        assert(level.head != NULL_SLOT);
+
+        Order& order = pool_.at(level.head);
+        assert(order.handle != 0);
+        assert(fill_qty > 0 && fill_qty <= order.remaining);
+        assert(level.total_qty >= fill_qty);
+
+        const Side side = order.side;
+        level.total_qty -= fill_qty;
+        order.remaining -= fill_qty;
+
+        if (order.remaining == 0) {
+            const uint32_t slot = level.head;
+            unlink(pool_, level, slot);
+            if (level.order_count == 0) {
+                bitmap_.clear(idx);
+                update_best_on_empty(side, idx);
+            }
+            pool_.free(slot);
+        }
+
+        assert(check_local(idx));
     }
 
     // Cheap local invariant entry point for operation-adjacent checks. Passing
@@ -331,50 +382,38 @@ class Book {
         return allocated_count + free_count == PoolCapacity && seen_slots.all();
     }
 
-    [[nodiscard]] std::optional<std::size_t> best_bid_idx() const noexcept {
+    std::optional<std::size_t> best_bid_idx() const noexcept {
         return best_bid_idx_;
     }
 
-    [[nodiscard]] std::optional<std::size_t> best_ask_idx() const noexcept {
+    std::optional<std::size_t> best_ask_idx() const noexcept {
         return best_ask_idx_;
     }
 
-    [[nodiscard]] const Level& level(std::size_t idx) const noexcept {
+    std::optional<std::size_t> best_idx(Side side) const noexcept {
+        return side == Side::Bid ? best_bid_idx_ : best_ask_idx_;
+    }
+
+    const Level& level(std::size_t idx) const noexcept {
         assert(idx < NumLevels);
         return levels_[idx];
     }
 
-    [[nodiscard]] bool occupied(std::size_t idx) const noexcept {
+    bool occupied(std::size_t idx) const noexcept {
         assert(idx < NumLevels);
         return bitmap_.test(idx);
     }
 
-    [[nodiscard]] Pool<PoolCapacity>& pool() noexcept {
+    Pool<PoolCapacity>& pool() noexcept {
         return pool_;
     }
 
-    [[nodiscard]] const Pool<PoolCapacity>& pool() const noexcept {
+    const Pool<PoolCapacity>& pool() const noexcept {
         return pool_;
     }
 
   private:
-    [[nodiscard]] static Price index_to_price(std::size_t idx) noexcept {
-        return BasePrice + static_cast<Price>(idx);
-    }
-
-    [[nodiscard]] static std::optional<std::size_t> price_to_index(Price price) noexcept {
-        if (price < BasePrice) {
-            return std::nullopt;
-        }
-
-        const auto idx = static_cast<std::size_t>(price - BasePrice);
-        if (idx >= NumLevels) {
-            return std::nullopt;
-        }
-        return idx;
-    }
-
-    [[nodiscard]] bool check_level_local(std::size_t idx) const noexcept {
+    bool check_level_local(std::size_t idx) const noexcept {
         const Level& current = levels_[idx];
         const bool occupied_level = current.order_count > 0;
         // Local checks intentionally stop at endpoints; full traversal belongs
@@ -397,7 +436,7 @@ class Book {
                tail.handle != 0;
     }
 
-    [[nodiscard]] bool check_best_local() const noexcept {
+    bool check_best_local() const noexcept {
         if (best_bid_idx_) {
             if (*best_bid_idx_ >= NumLevels || !bitmap_.test(*best_bid_idx_)) {
                 return false;
@@ -421,9 +460,9 @@ class Book {
         return !best_bid_idx_ || !best_ask_idx_ || *best_bid_idx_ < *best_ask_idx_;
     }
 
-    [[nodiscard]] bool would_cross(Side side, std::size_t idx) const noexcept {
-        // Phase 2 only rests passive orders. If an order would trade through
-        // the opposite best, Phase 3 matching must consume it before rest.
+    bool would_cross(Side side, std::size_t idx) const noexcept {
+        // This structural book only stores resting orders. If an order would
+        // trade through the opposite best, matching code must consume it before rest.
         if (side == Side::Bid) {
             return best_ask_idx_.has_value() && idx >= *best_ask_idx_;
         }

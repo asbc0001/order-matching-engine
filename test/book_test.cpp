@@ -11,13 +11,13 @@
 
 namespace {
 
-[[nodiscard]] bool fail(const char* message) {
+bool fail(const char* message) {
     std::fprintf(stderr, "%s\n", message);
     return false;
 }
 
-[[nodiscard]] bool expect_best(std::optional<std::size_t> actual,
-                               std::optional<std::size_t> expected, const char* message) {
+bool expect_best(std::optional<std::size_t> actual, std::optional<std::size_t> expected,
+                 const char* message) {
     if (actual != expected) {
         return fail(message);
     }
@@ -25,8 +25,8 @@ namespace {
 }
 
 template <std::size_t Capacity>
-[[nodiscard]] uint32_t make_order(ob::Pool<Capacity>& pool, ob::Price price, ob::Qty qty,
-                                  ob::Side side = ob::Side::Bid) {
+uint32_t make_order(ob::Pool<Capacity>& pool, ob::Price price, ob::Qty qty,
+                    ob::Side side = ob::Side::Bid) {
     // Mirror the future insert path: populate semantic order fields before
     // append_tail reads remaining and threads the slot into a level.
     auto alloc = pool.alloc();
@@ -42,9 +42,8 @@ template <std::size_t Capacity>
 }
 
 template <std::size_t Capacity>
-[[nodiscard]] bool expect_level(const ob::Pool<Capacity>& pool, const ob::Level& level,
-                                uint32_t head, uint32_t tail, ob::AggQty total_qty,
-                                uint32_t order_count, const char* message) {
+bool expect_level(const ob::Pool<Capacity>& pool, const ob::Level& level, uint32_t head,
+                  uint32_t tail, ob::AggQty total_qty, uint32_t order_count, const char* message) {
     // Shared check for the local invariants these list operations must keep
     // true after every mutation.
     if (level.head != head || level.tail != tail || level.total_qty != total_qty ||
@@ -60,7 +59,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_append_tail_fifo_links() {
+bool check_append_tail_fifo_links() {
     ob::Pool<4> pool;
     ob::Level level;
 
@@ -91,7 +90,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_unlink_head_middle_tail() {
+bool check_unlink_head_middle_tail() {
     ob::Pool<6> pool;
     ob::Level level;
     const uint32_t first = make_order(pool, 102, 10);
@@ -138,7 +137,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_pop_head() {
+bool check_pop_head() {
     ob::Pool<4> pool;
     ob::Level level;
     const uint32_t first = make_order(pool, 103, 11);
@@ -177,7 +176,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_insert_updates_best_and_levels() {
+bool check_book_insert_updates_best_and_levels() {
     ob::Book<ob::config::kFuzz.num_levels, 8> book;
 
     const auto first_bid = book.insert(ob::Side::Bid, 10, 100, 1);
@@ -221,7 +220,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_remove_repairs_best_only_when_needed() {
+bool check_book_remove_repairs_best_only_when_needed() {
     ob::Book<ob::config::kFuzz.num_levels, 8> book;
 
     const auto low_bid = book.insert(ob::Side::Bid, 5, 10, 1);
@@ -312,7 +311,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_best_repairs_across_bitmap_words() {
+bool check_book_best_repairs_across_bitmap_words() {
     ob::Book<ob::config::kFuzz.num_levels, 8> bid_book;
 
     const auto bid_63 = bid_book.insert(ob::Side::Bid, 63, 10, 1);
@@ -382,7 +381,7 @@ template <std::size_t Capacity>
     return bid_book.audit() && ask_book.audit();
 }
 
-[[nodiscard]] bool check_book_edges_and_failures() {
+bool check_book_edges_and_failures() {
     ob::Book<ob::config::kFuzz.num_levels, 2> book;
     constexpr ob::Price kLastPrice =
         ob::config::BASE_PRICE + static_cast<ob::Price>(ob::config::kFuzz.num_levels - 1);
@@ -424,7 +423,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_rejects_crossed_resting_orders() {
+bool check_book_rejects_crossed_resting_orders() {
     ob::Book<ob::config::kFuzz.num_levels, 4> book;
 
     const auto bid = book.insert(ob::Side::Bid, 10, 10, 1);
@@ -432,8 +431,8 @@ template <std::size_t Capacity>
     if (!bid || !ask) {
         return fail("Book crossing setup failed");
     }
-    // Crossed orders are Phase 3 matching inputs; Phase 2's passive book should
-    // reject them rather than storing an invalid resting state.
+    // Crossed orders belong to matching logic; this structural book rejects
+    // them rather than storing an invalid resting state.
     if (book.insert(ob::Side::Bid, 12, 10, 3)) {
         return fail("Book accepted bid crossing best ask");
     }
@@ -444,7 +443,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_invariant_entry_points() {
+bool check_book_invariant_entry_points() {
     ob::Book<ob::config::kFuzz.num_levels, 8> book;
     // The public invariant entry points should be useful on both fresh and
     // mutated books; later fuzzing can call the same functions directly.
@@ -471,7 +470,7 @@ template <std::size_t Capacity>
     return true;
 }
 
-[[nodiscard]] bool check_book_mixed_side_randomized_churn() {
+bool check_book_mixed_side_randomized_churn() {
     struct LiveOrder {
         ob::Handle handle;
         std::size_t idx;
@@ -496,8 +495,8 @@ template <std::size_t Capacity>
         const bool do_insert = must_insert || (!must_remove && ((rng() & 3u) != 0));
 
         if (do_insert) {
-            // Keep bids and asks in separated bands so Phase 2 can exercise
-            // both sides without invoking Phase 3 matching behavior.
+            // Keep bids and asks in separated bands so this test exercises both
+            // sides without invoking matching behavior.
             const bool bid = (rng() & 1u) == 0;
             const std::size_t idx =
                 bid ? static_cast<std::size_t>(rng() % kBidBand)

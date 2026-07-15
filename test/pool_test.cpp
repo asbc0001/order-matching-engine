@@ -10,14 +10,14 @@
 
 namespace {
 
-[[nodiscard]] bool fail(const char* message) {
+bool fail(const char* message) {
     std::fprintf(stderr, "%s\n", message);
     return false;
 }
 
 // Covers the direct, hand-written edge cases that should be easy to reason
 // about before the randomized churn test runs.
-[[nodiscard]] bool check_basic_pool_behavior() {
+bool check_basic_pool_behavior() {
     ob::Pool<4> pool;
     if (pool.capacity() != 4) {
         return fail("Pool capacity mismatch");
@@ -83,7 +83,7 @@ namespace {
     return true;
 }
 
-[[nodiscard]] bool check_generation_wrap() {
+bool check_generation_wrap() {
     // Generation 0 is never used, even when uint32_t wraparound occurs.
     ob::Pool<1> wrap_pool;
     wrap_pool.set_generation_for_test(0, UINT32_MAX);
@@ -103,7 +103,7 @@ namespace {
     return true;
 }
 
-[[nodiscard]] bool check_slot_access() {
+bool check_slot_access() {
     ob::Pool<2> pool;
     auto alloc = pool.alloc();
     if (!alloc) {
@@ -126,7 +126,7 @@ namespace {
     return true;
 }
 
-[[nodiscard]] bool check_randomized_churn() {
+bool check_randomized_churn() {
     struct LiveOrder {
         uint32_t slot;
         ob::Handle handle;

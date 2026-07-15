@@ -19,7 +19,7 @@ enum class MsgType : uint8_t {
     NewLimit,
     NewMarket,
     Cancel,
-    Stop  // Internal-only shutdown sentinel; external decoders must reject it.
+    StopEngine  // Internal-only shutdown sentinel; external decoders must reject it.
 };
 
 using Price = int64_t;    // integer ticks: no floats in matching state/decisions
@@ -43,13 +43,15 @@ struct alignas(64) InboundMsg {  // one cache line, internal representation
     // file or wire formats.
 };
 
+// Events are the matcher's output stream. One input command can produce several
+// events: fills for trades, then one final ack or reject that completes it.
 enum class EventType : uint8_t {
-    AckNew,
-    AckCancel,
-    Fill,
-    Reject,
-    Stop  // Internal-only shutdown event; loggers should drain it but exclude
-          // it from replayable event logs.
+    AckNew,     // New order accepted and any remainder rested in the book
+    AckCancel,  // Cancel accepted and the resting order was removed
+    Fill,       // Trade report for one side of a match
+    Reject,     // Request failed validation or could not be fully completed
+    StopEngine  // Internal-only shutdown event; loggers should drain it but exclude
+                // it from replayable event logs
 };
 
 enum class RejectReason : uint8_t {
@@ -64,8 +66,9 @@ enum class RejectReason : uint8_t {
 
 enum EventFlags : uint8_t { RequestComplete = 1 << 0 };
 
-// Result emitted by the matching engine. The logger consumes these from the
-// outbound ring to record acknowledgements, fills, rejects, and shutdown.
+// Result emitted by the matching engine. Acks confirm accepted state changes,
+// fills report trades, rejects explain failed requests, and StopEngine shuts
+// down internal runners.
 struct alignas(64) OutboundEvent {
     uint64_t client_seq;
     Handle handle;
