@@ -28,8 +28,6 @@ bool expect_best(std::optional<std::size_t> actual, std::optional<std::size_t> e
 template <std::size_t Capacity>
 uint32_t make_order(ob::Pool<Capacity>& pool, ob::Price price, ob::Qty qty,
                     ob::Side side = ob::Side::Bid) {
-    // Mirror the future insert path: populate semantic order fields before
-    // append_tail reads remaining and threads the slot into a level.
     auto alloc = pool.alloc();
     if (!alloc) {
         return ob::NULL_SLOT;
@@ -45,8 +43,6 @@ uint32_t make_order(ob::Pool<Capacity>& pool, ob::Price price, ob::Qty qty,
 template <std::size_t Capacity>
 bool expect_level(const ob::Pool<Capacity>& pool, const ob::Level& level, uint32_t head,
                   uint32_t tail, ob::AggQty total_qty, uint32_t order_count, const char* message) {
-    // Shared check for the local invariants these list operations must keep
-    // true after every mutation.
     if (level.head != head || level.tail != tail || level.total_qty != total_qty ||
         level.order_count != order_count) {
         return fail(message);
@@ -108,8 +104,7 @@ bool check_unlink_head_middle_tail() {
     ob::append_tail(pool, level, third);
     ob::append_tail(pool, level, fourth);
 
-    // Exercise all non-only removal shapes on one list so neighbor repairs are
-    // checked after each mutation.
+    // Remove head, middle, and tail from one list.
     ob::unlink(pool, level, first);
     if (!expect_level(pool, level, second, fourth, 90, 3, "head unlink level state failed")) {
         return false;
@@ -243,8 +238,7 @@ bool check_book_remove_repairs_best_only_when_needed() {
         return fail("Book did not clear non-best bid bitmap bit");
     }
 
-    // Removing one order from a multi-order best level must not trigger a best
-    // rescan or clear that level's bitmap bit.
+    // Removing one order should not empty the best price level.
     if (!book.remove(*best_bid)) {
         return fail("Book failed to remove best bid");
     }
@@ -259,8 +253,7 @@ bool check_book_remove_repairs_best_only_when_needed() {
     if (!book.remove(*second_best_bid)) {
         return fail("Book failed to empty best bid level");
     }
-    // Once the best level is truly empty, the bid pointer repairs downward to
-    // the next occupied bid level.
+    // Once the best price level is empty, best bid moves down.
     if (!expect_best(book.best_bid_idx(), std::optional<std::size_t>{7},
                      "Book did not rescan best bid downward")) {
         return false;
@@ -282,8 +275,7 @@ bool check_book_remove_repairs_best_only_when_needed() {
     if (!book.remove(*best_ask)) {
         return fail("Book failed to remove best ask");
     }
-    // Same contract for asks: partial emptying of the best level leaves the
-    // cached best alone until the last order at that level is removed.
+    // Same rule for asks: best stays until the price level is empty.
     if (!expect_best(book.best_ask_idx(), std::optional<std::size_t>{20},
                      "Book moved best ask while best level still had orders")) {
         return false;
@@ -324,8 +316,7 @@ bool check_book_best_repairs_across_bitmap_words() {
         return fail("Book word-boundary bid setup failed");
     }
 
-    // Emptying best bids walks downward across the same 127/128 and 63/64
-    // boundaries the bitmap unit tests cover directly.
+    // Emptying best bids walks downward across bitmap word boundaries.
     if (!bid_book.remove(*bid_128) ||
         !expect_best(bid_book.best_bid_idx(), std::optional<std::size_t>{127},
                      "Book best bid did not repair from 128 to 127")) {
@@ -357,7 +348,7 @@ bool check_book_best_repairs_across_bitmap_words() {
         return fail("Book word-boundary ask setup failed");
     }
 
-    // Emptying best asks walks upward across those boundaries.
+    // Emptying best asks walks upward across bitmap word boundaries.
     if (!ask_book.remove(*ask_63) ||
         !expect_best(ask_book.best_ask_idx(), std::optional<std::size_t>{64},
                      "Book best ask did not repair from 63 to 64")) {
@@ -396,8 +387,7 @@ bool check_book_edges_and_failures() {
         return fail("Book band-edge bitmap bits were not set");
     }
 
-    // With two successful edge inserts and capacity 2, later valid inserts
-    // also prove the pool-exhaustion path is clean.
+    // Capacity is full after the two edge inserts.
     if (book.insert(ob::Side::Bid, ob::config::BASE_PRICE - 1, 1, 3)) {
         return fail("Book accepted below-band price");
     }
@@ -432,8 +422,7 @@ bool check_book_rejects_crossed_resting_orders() {
     if (!bid || !ask) {
         return fail("Book crossing setup failed");
     }
-    // Crossed orders belong to matching logic; this structural book rejects
-    // them rather than storing an invalid resting state.
+    // Crossed orders must be matched, not stored as resting orders.
     if (book.insert(ob::Side::Bid, 12, 10, 3)) {
         return fail("Book accepted bid crossing best ask");
     }
@@ -461,16 +450,13 @@ bool check_book_mixed_side_randomized_churn() {
     live.reserve(kCapacity);
     std::mt19937_64 rng{0x51DE5};
 
-    // The gap between kBidBand and kAskBase guarantees the random stream never
-    // crosses, while still exercising both cached best pointers.
+    // Keep bids and asks separated so this structural test never crosses.
     for (std::size_t op = 0; op < kOperations; ++op) {
         const bool must_insert = live.empty();
         const bool must_remove = live.size() == kCapacity;
         const bool do_insert = must_insert || (!must_remove && ((rng() & 3u) != 0));
 
         if (do_insert) {
-            // Keep bids and asks in separated bands so this test exercises both
-            // sides without invoking matching behavior.
             const bool bid = (rng() & 1u) == 0;
             const std::size_t idx =
                 bid ? static_cast<std::size_t>(rng() % kBidBand)

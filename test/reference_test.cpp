@@ -1,4 +1,4 @@
-// reference_test.cpp - Compare the optimized matcher with a simple oracle.
+// reference_test.cpp - Compare the optimized matcher with a simple reference book.
 
 #include <array>
 #include <cstdio>
@@ -14,7 +14,7 @@
 namespace {
 
 using Engine = ob::Matcher<ob::config::kFuzz.num_levels, 8>;
-using Oracle = ob::test::ReferenceBook<ob::config::kFuzz.num_levels, 8>;
+using Reference = ob::test::ReferenceBook<ob::config::kFuzz.num_levels, 8>;
 
 struct RecordingSink {
     std::vector<ob::OutboundEvent> events;
@@ -74,14 +74,16 @@ ob::InboundMsg cancel_msg(uint64_t client_seq, ob::Handle handle) noexcept {
 
 class EventComparator {
   public:
+    // Compare each operation's events in emission order. Engine/reference
+    // handles differ, so AckNew records which handles mean the same order.
     bool streams_match(const std::vector<ob::OutboundEvent>& engine_events,
-                       const std::vector<ob::OutboundEvent>& oracle_events) {
-        if (engine_events.size() != oracle_events.size()) {
+                       const std::vector<ob::OutboundEvent>& reference_events) {
+        if (engine_events.size() != reference_events.size()) {
             return fail("event stream sizes differed");
         }
 
         for (std::size_t i = 0; i < engine_events.size(); ++i) {
-            if (!event_matches(engine_events[i], oracle_events[i])) {
+            if (!event_matches(engine_events[i], reference_events[i])) {
                 std::fprintf(stderr, "event mismatch at index %zu\n", i);
                 return false;
             }
@@ -90,57 +92,58 @@ class EventComparator {
         return true;
     }
 
-    std::optional<ob::Handle> oracle_handle_for(ob::Handle engine_handle) const {
-        const auto mapped = engine_to_oracle_.find(engine_handle);
-        if (mapped == engine_to_oracle_.end()) {
+    std::optional<ob::Handle> reference_handle_for(ob::Handle engine_handle) const {
+        const auto mapped = engine_to_reference_.find(engine_handle);
+        if (mapped == engine_to_reference_.end()) {
             return std::nullopt;
         }
         return mapped->second;
     }
 
   private:
-    bool event_matches(const ob::OutboundEvent& engine, const ob::OutboundEvent& oracle) {
-        if (engine.client_seq != oracle.client_seq || engine.price != oracle.price ||
-            engine.qty != oracle.qty || engine.side != oracle.side || engine.type != oracle.type ||
-            engine.reason != oracle.reason || engine.flags != oracle.flags) {
+    bool event_matches(const ob::OutboundEvent& engine, const ob::OutboundEvent& reference) {
+        if (engine.client_seq != reference.client_seq || engine.price != reference.price ||
+            engine.qty != reference.qty || engine.side != reference.side ||
+            engine.type != reference.type || engine.reason != reference.reason ||
+            engine.flags != reference.flags) {
             return false;
         }
 
         if (engine.type == ob::EventType::AckNew) {
-            if (engine.handle == 0 || oracle.handle == 0) {
+            if (engine.handle == 0 || reference.handle == 0) {
                 return false;
             }
-            // AckNew is where the two independent handle schemes become comparable.
-            engine_to_oracle_[engine.handle] = oracle.handle;
+            // AckNew is where the two handle values become comparable.
+            engine_to_reference_[engine.handle] = reference.handle;
             return true;
         }
 
-        if (engine.handle == 0 || oracle.handle == 0) {
-            return engine.handle == oracle.handle;
+        if (engine.handle == 0 || reference.handle == 0) {
+            return engine.handle == reference.handle;
         }
 
-        const auto mapped = engine_to_oracle_.find(engine.handle);
-        return mapped != engine_to_oracle_.end() && mapped->second == oracle.handle;
+        const auto mapped = engine_to_reference_.find(engine.handle);
+        return mapped != engine_to_reference_.end() && mapped->second == reference.handle;
     }
 
-    std::unordered_map<ob::Handle, ob::Handle> engine_to_oracle_;
+    std::unordered_map<ob::Handle, ob::Handle> engine_to_reference_;
 };
 
-bool process_and_compare(Engine& engine, Oracle& oracle, const ob::InboundMsg& engine_msg,
-                         const ob::InboundMsg& oracle_msg, EventComparator& comparator) {
+bool process_and_compare(Engine& engine, Reference& reference, const ob::InboundMsg& engine_msg,
+                         const ob::InboundMsg& reference_msg, EventComparator& comparator) {
     RecordingSink engine_sink;
-    RecordingSink oracle_sink;
+    RecordingSink reference_sink;
 
     engine.process(engine_msg, engine_sink);
-    oracle.process(oracle_msg, oracle_sink);
+    reference.process(reference_msg, reference_sink);
 
-    return comparator.streams_match(engine_sink.events, oracle_sink.events) &&
+    return comparator.streams_match(engine_sink.events, reference_sink.events) &&
            engine.book().audit();
 }
 
 bool check_deterministic_sequence_matches_reference() {
     Engine engine;
-    Oracle oracle;
+    Reference reference;
     EventComparator comparator;
 
     // Rest asks, cross them, then verify market consume/rest/cancel behavior.
@@ -150,7 +153,7 @@ bool check_deterministic_sequence_matches_reference() {
         limit_msg(5, ob::Side::Bid, 99, 7),
     };
     for (const ob::InboundMsg& command : sequence) {
-        if (!process_and_compare(engine, oracle, command, command, comparator)) {
+        if (!process_and_compare(engine, reference, command, command, comparator)) {
             return false;
         }
     }
@@ -163,14 +166,14 @@ bool check_deterministic_sequence_matches_reference() {
         return fail("engine cancel setup handle missing");
     }
 
-    // The oracle uses its own handle scheme; AckNew correspondence is checked
-    // in event comparison, while cancel inputs must use each engine's handle.
-    const std::optional<ob::Handle> oracle_handle = comparator.oracle_handle_for(engine_handle);
-    if (!oracle_handle) {
-        return fail("oracle cancel setup handle missing");
+    // Cancel inputs must use each implementation's own handle.
+    const std::optional<ob::Handle> reference_handle =
+        comparator.reference_handle_for(engine_handle);
+    if (!reference_handle) {
+        return fail("reference cancel setup handle missing");
     }
-    return process_and_compare(engine, oracle, cancel_msg(6, engine_handle),
-                               cancel_msg(6, *oracle_handle), comparator);
+    return process_and_compare(engine, reference, cancel_msg(6, engine_handle),
+                               cancel_msg(6, *reference_handle), comparator);
 }
 
 }  // namespace

@@ -1,4 +1,4 @@
-// reference_book.hpp - Slow, obvious matcher used as a test oracle.
+// reference_book.hpp - Slow, simple matcher used for expected test behavior.
 //
 // This book deliberately uses standard containers and linear scans. It is not
 // meant to be fast; it is meant to be independent from the optimized intrusive
@@ -11,7 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <map>
 #include <optional>
 

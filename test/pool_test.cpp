@@ -16,8 +16,7 @@ bool fail(const char* message) {
     return false;
 }
 
-// Covers the direct, hand-written edge cases that should be easy to reason
-// about before the randomized churn test runs.
+// Basic edge cases before randomized churn.
 bool check_basic_pool_behavior() {
     ob::Pool<4> pool;
     if (pool.capacity() != 4) {
@@ -138,9 +137,7 @@ bool check_randomized_churn() {
 
     ob::Pool<kCapacity> pool;
 
-    // The oracle tracks which handles should be live independently of the
-    // pool's own storage. If the pool loses, duplicates, or resurrects a
-    // handle, the oracle checks below should catch it.
+    // Track live handles outside the pool so reuse/stale bugs are visible.
     std::vector<LiveOrder> live;
     live.reserve(kCapacity);
     std::set<ob::Handle> live_handles;
@@ -192,7 +189,7 @@ bool check_randomized_churn() {
             // touched by this operation.
             for (const LiveOrder& order : live) {
                 if (live_handles.find(order.handle) == live_handles.end()) {
-                    return fail("Churn oracle lost a live handle");
+                    return fail("Churn tracking set lost a live handle");
                 }
                 if (pool.resolve(order.handle) == nullptr) {
                     return fail("Churn live handle stopped resolving");

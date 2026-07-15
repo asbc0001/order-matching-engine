@@ -126,6 +126,13 @@ std::optional<ob::Handle> rest_limit(Matcher& matcher, uint64_t seq, ob::Side si
     return sink.events[0].handle;
 }
 
+template <typename Matcher>
+bool process_has_one_complete(Matcher& matcher, const ob::InboundMsg& command) {
+    RecordingSink sink;
+    matcher.process(command, sink);
+    return one_complete(sink);
+}
+
 // Bad limit inputs should reject immediately and leave the book unchanged.
 bool check_limit_validation_rejects() {
     TestMatcher matcher;
@@ -346,11 +353,39 @@ bool check_stop_engine_emits_internal_event() {
            sink.events[0].handle == 0 && matcher.book().audit();
 }
 
+// Representative success, reject, fill, cancel, and shutdown paths all complete once.
+bool check_request_complete_across_representative_paths() {
+    TestMatcher matcher;
+
+    const auto ask = rest_limit(matcher, 200, ob::Side::Ask, 100, 10);
+    if (!ask) {
+        return false;
+    }
+
+    // Rest, reject, fill, and market-reject paths.
+    if (!process_has_one_complete(matcher, limit_msg(201, ob::Side::Bid, 90, 5)) ||
+        !process_has_one_complete(matcher, limit_msg(202, ob::Side::Bid, 90, 0)) ||
+        !process_has_one_complete(matcher, market_msg(203, ob::Side::Bid, 5)) ||
+        !process_has_one_complete(matcher, market_msg(204, ob::Side::Ask, 5))) {
+        return false;
+    }
+
+    const auto cancel_handle = rest_limit(matcher, 205, ob::Side::Ask, 101, 10);
+    if (!cancel_handle) {
+        return false;
+    }
+
+    // Cancel success, cancel reject, and shutdown paths.
+    return process_has_one_complete(matcher, cancel_msg(206, *cancel_handle)) &&
+           process_has_one_complete(matcher, cancel_msg(207, 0)) &&
+           process_has_one_complete(matcher, stop_engine_msg(208)) && matcher.book().audit();
+}
+
 }  // namespace
 
 int main() {
     using Check = bool (*)();
-    constexpr std::array<Check, 14> checks{
+    constexpr std::array<Check, 15> checks{
         check_limit_validation_rejects,
         check_limit_rests_and_acknowledges_handle,
         check_market_empty_rejects,
@@ -365,6 +400,7 @@ int main() {
         check_cancel_acknowledges_and_removes,
         check_unknown_cancel_rejects,
         check_stop_engine_emits_internal_event,
+        check_request_complete_across_representative_paths,
     };
 
     for (Check check : checks) {
