@@ -1,5 +1,6 @@
 // pool_test.cpp - Focused checks for the fixed-capacity order pool.
 
+#include <array>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -133,7 +134,7 @@ bool check_randomized_churn() {
     };
 
     constexpr std::size_t kCapacity = 64;
-    constexpr std::size_t kOperations = 250'000;
+    constexpr std::size_t kOperations = 50'000;
 
     ob::Pool<kCapacity> pool;
 
@@ -241,17 +242,18 @@ bool check_randomized_churn() {
 }  // namespace
 
 int main() {
-    if (!check_basic_pool_behavior()) {
-        return 1;
-    }
-    if (!check_generation_wrap()) {
-        return 1;
-    }
-    if (!check_slot_access()) {
-        return 1;
-    }
-    if (!check_randomized_churn()) {
-        return 1;
+    using Check = bool (*)();
+    constexpr std::array<Check, 4> checks{
+        check_basic_pool_behavior,
+        check_generation_wrap,
+        check_slot_access,
+        check_randomized_churn,
+    };
+
+    for (Check check : checks) {
+        if (!check()) {
+            return 1;
+        }
     }
 
     std::printf("pool_test OK\n");

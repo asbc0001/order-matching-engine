@@ -1,7 +1,3 @@
-add_executable(smoke_test smoke_test.cpp)
-target_link_libraries(smoke_test PRIVATE orderbook_core)
-add_test(NAME smoke_test COMMAND smoke_test)
-
 add_executable(pool_test pool_test.cpp)
 target_link_libraries(pool_test PRIVATE orderbook_core)
 target_compile_definitions(pool_test PRIVATE OB_ENABLE_TEST_HOOKS)
@@ -18,3 +14,7 @@ add_test(NAME book_test COMMAND book_test)
 add_executable(matcher_test matcher_test.cpp)
 target_link_libraries(matcher_test PRIVATE orderbook_core)
 add_test(NAME matcher_test COMMAND matcher_test)
+
+add_executable(reference_test reference_test.cpp)
+target_link_libraries(reference_test PRIVATE orderbook_core)
+add_test(NAME reference_test COMMAND reference_test)

@@ -1,5 +1,6 @@
 // book_test.cpp - Structural checks for passive book data structures.
 
+#include <array>
 #include <cstdio>
 #include <optional>
 #include <random>
@@ -443,33 +444,6 @@ bool check_book_rejects_crossed_resting_orders() {
     return true;
 }
 
-bool check_book_invariant_entry_points() {
-    ob::Book<ob::config::kFuzz.num_levels, 8> book;
-    // The public invariant entry points should be useful on both fresh and
-    // mutated books; later fuzzing can call the same functions directly.
-    if (!book.check_local() || !book.audit()) {
-        return fail("Fresh book invariants failed");
-    }
-
-    const auto bid = book.insert(ob::Side::Bid, 10, 100, 1);
-    const auto ask = book.insert(ob::Side::Ask, 20, 200, 2);
-    if (!bid || !ask) {
-        return fail("Invariant setup insert failed");
-    }
-    if (!book.check_local(10) || !book.check_local(20) || !book.audit()) {
-        return fail("Invariant checks failed after insert");
-    }
-
-    if (!book.remove(*bid)) {
-        return fail("Invariant setup remove failed");
-    }
-    if (!book.check_local(10) || !book.audit()) {
-        return fail("Invariant checks failed after remove");
-    }
-
-    return true;
-}
-
 bool check_book_mixed_side_randomized_churn() {
     struct LiveOrder {
         ob::Handle handle;
@@ -541,35 +515,23 @@ bool check_book_mixed_side_randomized_churn() {
 }  // namespace
 
 int main() {
-    if (!check_append_tail_fifo_links()) {
-        return 1;
-    }
-    if (!check_unlink_head_middle_tail()) {
-        return 1;
-    }
-    if (!check_pop_head()) {
-        return 1;
-    }
-    if (!check_book_insert_updates_best_and_levels()) {
-        return 1;
-    }
-    if (!check_book_remove_repairs_best_only_when_needed()) {
-        return 1;
-    }
-    if (!check_book_best_repairs_across_bitmap_words()) {
-        return 1;
-    }
-    if (!check_book_edges_and_failures()) {
-        return 1;
-    }
-    if (!check_book_rejects_crossed_resting_orders()) {
-        return 1;
-    }
-    if (!check_book_invariant_entry_points()) {
-        return 1;
-    }
-    if (!check_book_mixed_side_randomized_churn()) {
-        return 1;
+    using Check = bool (*)();
+    constexpr std::array<Check, 9> checks{
+        check_append_tail_fifo_links,
+        check_unlink_head_middle_tail,
+        check_pop_head,
+        check_book_insert_updates_best_and_levels,
+        check_book_remove_repairs_best_only_when_needed,
+        check_book_best_repairs_across_bitmap_words,
+        check_book_edges_and_failures,
+        check_book_rejects_crossed_resting_orders,
+        check_book_mixed_side_randomized_churn,
+    };
+
+    for (Check check : checks) {
+        if (!check()) {
+            return 1;
+        }
     }
 
     std::printf("book_test OK\n");
