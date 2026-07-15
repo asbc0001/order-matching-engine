@@ -200,6 +200,7 @@ class Matcher {
 
         const auto handle = book_.insert(msg.side, msg.price, remaining, msg.client_seq);
         if (!handle) {
+            assert(book_.pool().free_head_for_audit() == NULL_SLOT);
             events.finish(make_reject(msg, RejectReason::PoolExhausted, remaining));
             return;
         }

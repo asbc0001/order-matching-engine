@@ -3,6 +3,9 @@
 #include <array>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <optional>
 #include <random>
 #include <unordered_map>
@@ -16,6 +19,7 @@
 namespace {
 
 constexpr std::size_t kPoolCapacity = 32;
+constexpr std::size_t kProductionAuditEveryOps = 100'000;
 
 struct FuzzConfig {
     std::size_t ops_per_seed;
@@ -35,11 +39,6 @@ constexpr FuzzConfig kConfig{
 };
 
 static_assert(kConfig.limit_weight + kConfig.market_weight + kConfig.cancel_weight == 100);
-
-using Engine = ob::Matcher<ob::config::kFuzz.num_levels, kPoolCapacity>;
-
-// The reference book is slower and simpler, so it supplies the expected results.
-using Reference = ob::test::ReferenceBook<ob::config::kFuzz.num_levels, kPoolCapacity>;
 
 struct RecordingSink {
     std::vector<ob::OutboundEvent> events;
@@ -143,6 +142,27 @@ bool has_one_request_complete(const std::vector<ob::OutboundEvent>& events) {
     return count == 1;
 }
 
+std::size_t read_size_env(const char* name, std::size_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
+}
+
+std::optional<uint64_t> read_seed_env() {
+    const char* value = std::getenv("OB_FUZZ_SEED");
+    if (value == nullptr || *value == '\0') {
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(std::strtoull(value, nullptr, 0));
+}
+
+bool has_env_value(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0';
+}
+
 void record_coverage(const std::vector<ob::OutboundEvent>& events, Coverage& coverage) {
     // Engine and reference streams already matched; counting one side is enough.
     for (const ob::OutboundEvent& event : events) {
@@ -206,6 +226,16 @@ class FuzzerState {
         return removed_reference_handles_;
     }
 
+    // Pre-allocate storage for the largest run. This avoids rehashing and
+    // vector growth while the production-size fuzzer fills the book.
+    void reserve(std::size_t capacity) {
+        engine_to_reference_.reserve(capacity);
+        live_index_by_engine_.reserve(capacity);
+        live_.reserve(capacity);
+        removed_engine_handles_.reserve(capacity);
+        removed_reference_handles_.reserve(capacity);
+    }
+
     // Compare one command's events, then update the test's view of live and
     // removed orders only after the command is known to match.
     bool compare_and_apply(const std::vector<ob::OutboundEvent>& engine_events,
@@ -235,7 +265,8 @@ class FuzzerState {
     }
 
   private:
-    // AckNew creates the handle mapping; later fills and cancels must use it.
+    // AckNew handles differ between implementations, so later nonzero handles
+    // are compared through the mapping learned from earlier AckNew events.
     bool events_match(const ob::OutboundEvent& engine, const ob::OutboundEvent& reference) const {
         if (engine.client_seq != reference.client_seq || engine.price != reference.price ||
             engine.qty != reference.qty || engine.side != reference.side ||
@@ -255,11 +286,12 @@ class FuzzerState {
         return mapped && *mapped == reference.handle;
     }
 
-    // Update live/removed order state after a matching event pair.
+    // Update the fuzzer's client-side view after a matching event pair.
     void apply(const ob::OutboundEvent& engine, const ob::OutboundEvent& reference) {
         if (engine.type == ob::EventType::AckNew) {
             // AckNew tells us which handle each implementation assigned.
             engine_to_reference_[engine.handle] = reference.handle;
+            live_index_by_engine_[engine.handle] = live_.size();
             live_.push_back(LiveOrder{engine.handle, reference.handle, engine.qty});
             return;
         }
@@ -277,35 +309,43 @@ class FuzzerState {
 
     // Move an order from live to removed so future cancels can test rejection.
     void remove_live(ob::Handle engine_handle) {
-        for (std::size_t i = 0; i < live_.size(); ++i) {
-            if (live_[i].engine_handle != engine_handle) {
-                continue;
-            }
-            removed_engine_handles_.push_back(live_[i].engine_handle);
-            removed_reference_handles_.push_back(live_[i].reference_handle);
-            engine_to_reference_.erase(live_[i].engine_handle);
-            live_[i] = live_.back();
-            live_.pop_back();
+        // The index keeps production-size fuzzing from scanning every live order.
+        const auto found = live_index_by_engine_.find(engine_handle);
+        if (found == live_index_by_engine_.end()) {
             return;
         }
+
+        const std::size_t index = found->second;
+        removed_engine_handles_.push_back(live_[index].engine_handle);
+        removed_reference_handles_.push_back(live_[index].reference_handle);
+        engine_to_reference_.erase(live_[index].engine_handle);
+        live_index_by_engine_.erase(found);
+
+        if (index != live_.size() - 1) {
+            live_[index] = live_.back();
+            live_index_by_engine_[live_[index].engine_handle] = index;
+        }
+        live_.pop_back();
     }
 
     // Resting fills reduce client-visible remaining quantity; full fills remove.
     void reduce_live(ob::Handle engine_handle, ob::Qty fill_qty) {
-        for (LiveOrder& order : live_) {
-            if (order.engine_handle != engine_handle) {
-                continue;
-            }
-            if (fill_qty >= order.remaining) {
-                remove_live(engine_handle);
-            } else {
-                order.remaining -= fill_qty;
-            }
+        const auto found = live_index_by_engine_.find(engine_handle);
+        if (found == live_index_by_engine_.end()) {
             return;
+        }
+
+        LiveOrder& order = live_[found->second];
+        if (fill_qty >= order.remaining) {
+            remove_live(engine_handle);
+        } else {
+            order.remaining -= fill_qty;
         }
     }
 
     std::unordered_map<ob::Handle, ob::Handle> engine_to_reference_;
+    // Maps live engine handles to their slot in live_; swap-delete keeps it current.
+    std::unordered_map<ob::Handle, std::size_t> live_index_by_engine_;
     std::vector<LiveOrder> live_;
     std::vector<ob::Handle> removed_engine_handles_;
     std::vector<ob::Handle> removed_reference_handles_;
@@ -334,9 +374,9 @@ ob::Qty random_qty(std::mt19937_64& rng) {
 }
 
 // Generate prices that hit validation, band edges, random levels, and FIFO hot spots.
+template <std::size_t NumLevels>
 ob::Price random_price(std::mt19937_64& rng) {
-    constexpr ob::Price kLast =
-        ob::config::BASE_PRICE + static_cast<ob::Price>(ob::config::kFuzz.num_levels - 1);
+    constexpr ob::Price kLast = ob::config::BASE_PRICE + static_cast<ob::Price>(NumLevels - 1);
     switch (rng() % 10) {
         case 0:
             // Mix in out-of-band prices to keep validation paths covered.
@@ -353,7 +393,7 @@ ob::Price random_price(std::mt19937_64& rng) {
         case 5:
             return 101;
         default:
-            return static_cast<ob::Price>(rng() % ob::config::kFuzz.num_levels);
+            return static_cast<ob::Price>(rng() % NumLevels);
     }
 }
 
@@ -388,13 +428,14 @@ CommandPair random_cancel(uint64_t seq, std::mt19937_64& rng, const FuzzerState&
 
 // Choose the next operation. The same logical command goes to both books,
 // except cancels may need different mapped handles.
+template <std::size_t NumLevels>
 CommandPair random_command(uint64_t seq, std::mt19937_64& rng, const FuzzerState& state,
                            const FuzzConfig& config) {
     const uint64_t kind = rng() % 100;
     // Bias toward limits so the book usually has liquidity for markets/cancels.
     if (kind < config.limit_weight) {
-        const ob::InboundMsg command =
-            msg(seq, ob::MsgType::NewLimit, random_side(rng), random_price(rng), random_qty(rng));
+        const ob::InboundMsg command = msg(seq, ob::MsgType::NewLimit, random_side(rng),
+                                           random_price<NumLevels>(rng), random_qty(rng));
         return {command, command};
     }
     if (kind < config.limit_weight + config.market_weight) {
@@ -406,6 +447,7 @@ CommandPair random_command(uint64_t seq, std::mt19937_64& rng, const FuzzerState
 }
 
 // Process one command and stop immediately if behavior or book state diverges.
+template <typename Engine, typename Reference>
 bool process_and_check(Engine& engine, Reference& reference, FuzzerState& state, Coverage& coverage,
                        const CommandPair& command, uint64_t seed, std::size_t op,
                        const FuzzConfig& config) {
@@ -437,23 +479,32 @@ bool process_and_check(Engine& engine, Reference& reference, FuzzerState& state,
 }
 
 // Run one reproducible random stream.
+template <std::size_t NumLevels, std::size_t PoolCapacity>
 bool run_seed(uint64_t seed, const FuzzConfig& config, Coverage& coverage) {
-    Engine engine;
-    Reference reference;
+    using Engine = ob::Matcher<NumLevels, PoolCapacity>;
+    using Reference = ob::test::ReferenceBook<NumLevels, PoolCapacity>;
+
+    auto engine = std::make_unique<Engine>();
+    auto reference = std::make_unique<Reference>();
     FuzzerState state;
+    state.reserve(PoolCapacity);
     std::mt19937_64 rng{seed};
     std::size_t op = 0;
 
     // Start with a full book once so PoolExhausted is guaranteed, not random.
-    for (std::size_t i = 0; i < kPoolCapacity; ++i, ++op) {
-        const ob::InboundMsg command = msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 1, 1);
-        if (!process_and_check(engine, reference, state, coverage, {command, command}, seed, op,
+    // Spread orders across prices so production-size runs do not create one
+    // enormous reference-book level.
+    for (std::size_t i = 0; i < PoolCapacity; ++i, ++op) {
+        const ob::Price price = ob::config::BASE_PRICE + static_cast<ob::Price>(i % NumLevels);
+        const ob::InboundMsg command = msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, price, 1);
+        if (!process_and_check(*engine, *reference, state, coverage, {command, command}, seed, op,
                                config)) {
             return false;
         }
     }
-    const ob::InboundMsg exhausted = msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 2, 1);
-    if (!process_and_check(engine, reference, state, coverage, {exhausted, exhausted}, seed, op,
+    const ob::InboundMsg exhausted =
+        msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, ob::config::BASE_PRICE, 1);
+    if (!process_and_check(*engine, *reference, state, coverage, {exhausted, exhausted}, seed, op,
                            config)) {
         return false;
     }
@@ -461,8 +512,8 @@ bool run_seed(uint64_t seed, const FuzzConfig& config, Coverage& coverage) {
 
     for (std::size_t i = 0; i < config.ops_per_seed; ++i, ++op) {
         // A fixed seed makes any random failure exactly reproducible.
-        const CommandPair command = random_command(op + 1, rng, state, config);
-        if (!process_and_check(engine, reference, state, coverage, command, seed, op, config)) {
+        const CommandPair command = random_command<NumLevels>(op + 1, rng, state, config);
+        if (!process_and_check(*engine, *reference, state, coverage, command, seed, op, config)) {
             return false;
         }
     }
@@ -470,25 +521,79 @@ bool run_seed(uint64_t seed, const FuzzConfig& config, Coverage& coverage) {
     return true;
 }
 
-bool check_seeded_differential_fuzz() {
+std::vector<uint64_t> seeds_for_run(bool production_profile) {
+    if (const auto seed = read_seed_env()) {
+        return {*seed};
+    }
+
     constexpr std::array<uint64_t, 10> seeds{
         0xC0FFEEu,   0x51DE5u,    0xBADC0DEu,   0x12345678u, 0xA11CEu,
         0xFEEDFACEu, 0xDEADBEEFu, 0x987654321u, 0x31415926u, 0x27182818u,
     };
 
+    if (production_profile) {
+        return {seeds[0]};
+    }
+    return std::vector<uint64_t>{seeds.begin(), seeds.end()};
+}
+
+// Environment knobs keep the normal test quick while allowing the full gate:
+// OB_FUZZ_PROFILE=production OB_FUZZ_OPS=N OB_FUZZ_AUDIT_EVERY=N OB_FUZZ_SEED=N.
+FuzzConfig config_for_run(bool production_profile) {
+    FuzzConfig config = kConfig;
+    if (production_profile) {
+        config.audit_every_ops = kProductionAuditEveryOps;
+    }
+
+    config.ops_per_seed = read_size_env("OB_FUZZ_OPS", config.ops_per_seed);
+    config.audit_every_ops = read_size_env("OB_FUZZ_AUDIT_EVERY", config.audit_every_ops);
+    return config;
+}
+
+template <std::size_t NumLevels, std::size_t PoolCapacity>
+bool check_seeded_differential_fuzz(bool production_profile) {
+    const FuzzConfig config = config_for_run(production_profile);
     Coverage coverage;
-    for (uint64_t seed : seeds) {
-        if (!run_seed(seed, kConfig, coverage)) {
+
+    for (uint64_t seed : seeds_for_run(production_profile)) {
+        if (!run_seed<NumLevels, PoolCapacity>(seed, config, coverage)) {
             return false;
         }
     }
+
+    // Short explicit runs are useful for smoke checks and exact replay; the
+    // normal configured run still has to prove it hit the required paths.
+    if (has_env_value("OB_FUZZ_OPS") || has_env_value("OB_FUZZ_SEED")) {
+        return true;
+    }
     return check_coverage(coverage);
+}
+
+bool production_profile_requested() {
+    const char* profile = std::getenv("OB_FUZZ_PROFILE");
+    if (profile == nullptr || *profile == '\0') {
+        return false;
+    }
+    if (std::strcmp(profile, "small") == 0) {
+        return false;
+    }
+    if (std::strcmp(profile, "production") != 0) {
+        std::fprintf(stderr, "OB_FUZZ_PROFILE must be 'small' or 'production'\n");
+        std::exit(1);
+    }
+    return true;
 }
 
 }  // namespace
 
 int main() {
-    if (!check_seeded_differential_fuzz()) {
+    const bool production_profile = production_profile_requested();
+    const bool ok =
+        production_profile
+            ? check_seeded_differential_fuzz<ob::config::kProduction.num_levels,
+                                             ob::config::kProduction.pool_capacity>(true)
+            : check_seeded_differential_fuzz<ob::config::kFuzz.num_levels, kPoolCapacity>(false);
+    if (!ok) {
         return 1;
     }
 

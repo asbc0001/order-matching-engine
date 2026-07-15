@@ -13,6 +13,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <unordered_map>
 
 #include "orderbook/config.hpp"
 #include "orderbook/types.hpp"
@@ -22,6 +23,10 @@ namespace ob::test {
 template <std::size_t NumLevels, std::size_t Capacity, Price BasePrice = config::BASE_PRICE>
 class ReferenceBook {
   public:
+    ReferenceBook() {
+        handle_index_.reserve(Capacity);
+    }
+
     static constexpr Price limit_price() noexcept {
         return BasePrice + static_cast<Price>(NumLevels);
     }
@@ -84,6 +89,11 @@ class ReferenceBook {
 
     using AskBook = std::map<Price, std::deque<RefOrder>>;
     using BidBook = std::map<Price, std::deque<RefOrder>, std::greater<Price>>;
+
+    struct HandleLocation {
+        Price price;
+        Side side;
+    };
 
     static bool price_in_band(Price price) noexcept {
         return price >= BasePrice && price < limit_price();
@@ -283,6 +293,10 @@ class ReferenceBook {
         } else {
             asks_[order.price].push_back(order);
         }
+        const bool indexed =
+            handle_index_.emplace(order.handle, HandleLocation{order.price, order.side}).second;
+        (void)indexed;
+        assert(indexed);
         ++live_count_;
     }
 
@@ -299,56 +313,79 @@ class ReferenceBook {
             return std::nullopt;
         }
 
-        for (const auto& [price, orders] : bids_) {
-            (void)price;
-            for (const RefOrder& order : orders) {
-                if (order.handle == handle) {
-                    return order;
-                }
-            }
-        }
-        for (const auto& [price, orders] : asks_) {
-            (void)price;
-            for (const RefOrder& order : orders) {
-                if (order.handle == handle) {
-                    return order;
-                }
-            }
+        // Cancels should jump to the right level, not scan the whole book.
+        const auto location = handle_index_.find(handle);
+        if (location == handle_index_.end()) {
+            return std::nullopt;
         }
 
-        return std::nullopt;
+        const auto order = location->second.side == Side::Bid
+                               ? find_in(bids_, location->second.price, handle)
+                               : find_in(asks_, location->second.price, handle);
+        if (order == nullptr) {
+            return std::nullopt;
+        }
+
+        return *order;
     }
 
     bool erase(Handle handle) {
-        if (erase_from(bids_, handle) || erase_from(asks_, handle)) {
-            --live_count_;
-            return true;
+        const auto location = handle_index_.find(handle);
+        if (location == handle_index_.end()) {
+            return false;
         }
-        return false;
+
+        const bool erased = location->second.side == Side::Bid
+                                ? erase_from(bids_, location->second.price, handle)
+                                : erase_from(asks_, location->second.price, handle);
+        if (!erased) {
+            return false;
+        }
+
+        handle_index_.erase(location);
+        --live_count_;
+        return true;
     }
 
     template <typename Book>
-    static bool erase_from(Book& book, Handle handle) {
-        for (auto level = book.begin(); level != book.end(); ++level) {
-            auto& orders = level->second;
-            auto order = std::find_if(
-                orders.begin(), orders.end(),
-                [handle](const RefOrder& candidate) { return candidate.handle == handle; });
-            if (order == orders.end()) {
-                continue;
-            }
-
-            orders.erase(order);
-            if (orders.empty()) {
-                book.erase(level);
-            }
-            return true;
+    static const RefOrder* find_in(const Book& book, Price price, Handle handle) {
+        const auto level = book.find(price);
+        if (level == book.end()) {
+            return nullptr;
         }
-        return false;
+
+        const auto& orders = level->second;
+        const auto order = std::find_if(
+            orders.begin(), orders.end(),
+            [handle](const RefOrder& candidate) { return candidate.handle == handle; });
+        return order == orders.end() ? nullptr : &*order;
+    }
+
+    template <typename Book>
+    static bool erase_from(Book& book, Price price, Handle handle) {
+        auto level = book.find(price);
+        if (level == book.end()) {
+            return false;
+        }
+
+        auto& orders = level->second;
+        auto order = std::find_if(
+            orders.begin(), orders.end(),
+            [handle](const RefOrder& candidate) { return candidate.handle == handle; });
+        if (order == orders.end()) {
+            return false;
+        }
+
+        orders.erase(order);
+        if (orders.empty()) {
+            book.erase(level);
+        }
+        return true;
     }
 
     BidBook bids_;
     AskBook asks_;
+    std::unordered_map<Handle, HandleLocation> handle_index_;
     std::size_t live_count_{0};
     Handle next_handle_{1};
 };

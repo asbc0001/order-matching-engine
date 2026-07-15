@@ -80,7 +80,7 @@ bool expect_count(const RecordingSink& sink, std::size_t count, const char* mess
 bool expect_reject(const ob::OutboundEvent& event, uint64_t seq, ob::RejectReason reason,
                    ob::Qty qty, bool done = true) {
     if (event.type != ob::EventType::Reject || event.client_seq != seq || event.reason != reason ||
-        event.qty != qty || complete(event) != done) {
+        event.handle != 0 || event.price != 0 || event.qty != qty || complete(event) != done) {
         return fail("Reject event mismatch");
     }
     return true;
@@ -89,7 +89,8 @@ bool expect_reject(const ob::OutboundEvent& event, uint64_t seq, ob::RejectReaso
 bool expect_ack_new(const ob::OutboundEvent& event, uint64_t seq, ob::Price price, ob::Qty qty,
                     ob::Side side) {
     if (event.type != ob::EventType::AckNew || event.client_seq != seq || event.handle == 0 ||
-        event.price != price || event.qty != qty || event.side != side || !complete(event)) {
+        event.price != price || event.qty != qty || event.side != side ||
+        event.reason != ob::RejectReason::None || !complete(event)) {
         return fail("AckNew event mismatch");
     }
     return true;
@@ -99,7 +100,7 @@ bool expect_ack_cancel(const ob::OutboundEvent& event, uint64_t seq, ob::Handle 
                        ob::Price price, ob::Qty qty, ob::Side side) {
     if (event.type != ob::EventType::AckCancel || event.client_seq != seq ||
         event.handle != handle || event.price != price || event.qty != qty || event.side != side ||
-        !complete(event)) {
+        event.reason != ob::RejectReason::None || !complete(event)) {
         return fail("AckCancel event mismatch");
     }
     return true;
@@ -108,7 +109,8 @@ bool expect_ack_cancel(const ob::OutboundEvent& event, uint64_t seq, ob::Handle 
 bool expect_fill(const ob::OutboundEvent& event, uint64_t seq, ob::Handle handle, ob::Price price,
                  ob::Qty qty, ob::Side side, bool done) {
     if (event.type != ob::EventType::Fill || event.client_seq != seq || event.handle != handle ||
-        event.price != price || event.qty != qty || event.side != side || complete(event) != done) {
+        event.price != price || event.qty != qty || event.side != side ||
+        event.reason != ob::RejectReason::None || complete(event) != done) {
         return fail("Fill event mismatch");
     }
     return true;
@@ -350,7 +352,7 @@ bool check_stop_engine_emits_internal_event() {
     return expect_count(sink, 1, "StopEngine event count failed") &&
            sink.events[0].type == ob::EventType::StopEngine && sink.events[0].client_seq == 90 &&
            sink.events[0].reason == ob::RejectReason::None && sink.events[0].qty == 0 &&
-           sink.events[0].handle == 0 && matcher.book().audit();
+           sink.events[0].handle == 0 && sink.events[0].price == 0 && matcher.book().audit();
 }
 
 // Representative success, reject, fill, cancel, and shutdown paths all complete once.
