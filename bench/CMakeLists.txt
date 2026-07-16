@@ -1,0 +1,2 @@
+add_executable(spsc_ring_bench spsc_ring_bench.cpp)
+target_link_libraries(spsc_ring_bench PRIVATE orderbook_core)
