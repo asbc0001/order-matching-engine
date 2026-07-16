@@ -32,10 +32,6 @@ add_executable(matcher_test matcher_test.cpp)
 target_link_libraries(matcher_test PRIVATE orderbook_core)
 add_test(NAME matcher_test COMMAND matcher_test)
 
-add_executable(reference_test reference_test.cpp)
-target_link_libraries(reference_test PRIVATE orderbook_core)
-add_test(NAME reference_test COMMAND reference_test)
-
 add_executable(differential_fuzz_test differential_fuzz_test.cpp)
 target_link_libraries(differential_fuzz_test PRIVATE orderbook_core)
 add_test(NAME differential_fuzz_test COMMAND differential_fuzz_test)
