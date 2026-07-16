@@ -32,6 +32,8 @@ struct Payload {
 
 static_assert(std::is_trivially_copyable_v<Payload>);
 
+// Keep the payload small so the benchmark is about handoff overhead, not
+// application work done per message.
 constexpr uint64_t kDefaultMessages = 100'000'000;
 constexpr uint64_t kWarmupMessages = 1'000'000;
 constexpr std::size_t kRingCapacity = 65'536;
@@ -207,6 +209,9 @@ bool should_run(std::string_view selected, std::string_view name) noexcept {
     return selected == "all" || selected == name;
 }
 
+// Pinning reduces scheduler noise when the host exposes stable CPUs. The
+// benchmark still works as a correctness-preserving smoke run without claiming
+// final publishable timing on noisy environments.
 bool pin_current_thread(int cpu, const char* name) {
 #if defined(__linux__)
     cpu_set_t set;
@@ -291,6 +296,8 @@ Result run_queue(Queue& queue, uint64_t message_count, ThreadPlacement placement
     std::thread producer_thread{producer};
     std::thread consumer_thread{consumer};
 
+    // Start timing after both threads have been created and pinned. The timed
+    // region is the handoff loop itself, not thread setup.
     while (ready.load(std::memory_order_acquire) != 2) {
         pause_spin();
     }
@@ -313,6 +320,8 @@ Result run_queue(Queue& queue, uint64_t message_count, ThreadPlacement placement
 template <typename Queue>
 bool run_and_print(const char* name, Queue& queue, uint64_t message_count,
                    ThreadPlacement placement) {
+    // Warm the branch predictor, caches, and queue storage before the measured
+    // pass. The warmup uses the same correctness checks as the timed run.
     bool warmup_ok = false;
     (void)run_queue(queue, kWarmupMessages, placement, warmup_ok);
     if (!warmup_ok) {
@@ -333,6 +342,8 @@ bool run_and_print(const char* name, Queue& queue, uint64_t message_count,
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Defaults are chosen for a two-thread ring benchmark. Pass explicit CPU
+    // IDs after checking the host topology with lscpu.
     uint64_t message_count = kDefaultMessages;
     ThreadPlacement placement{
         .producer_cpu = 0,
@@ -362,6 +373,8 @@ int main(int argc, char** argv) {
 
     bool ran_any = false;
     bool ok = true;
+    // A variant selector lets longer reruns focus on the fast rows without
+    // spending time on the slower mutex baselines.
     if (should_run(selected_variant, "padded_spsc_ring")) {
         ran_any = true;
         ok = ok && run_and_print("padded_spsc_ring", padded_ring, message_count, placement);
