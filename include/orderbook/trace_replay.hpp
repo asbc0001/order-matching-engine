@@ -30,8 +30,7 @@ namespace ob::trace {
 //   byte  6:    kind    - what records the file contains; currently inbound commands
 //   byte  7:    reserved, always zero
 //
-// "Magic" is file-format slang for a fixed identifying value at the start of a
-// file. In bytes, TRACE_MAGIC spells "OBTR" for "orderbook trace".
+
 inline constexpr std::uint32_t TRACE_MAGIC = 0x5254424Fu;  // "OBTR" in little-endian bytes.
 inline constexpr std::uint16_t TRACE_VERSION = 1;
 inline constexpr std::uint8_t TRACE_KIND_INBOUND = 1;
@@ -172,8 +171,8 @@ inline InboundMsg make_stop_engine_msg(std::uint64_t client_seq) noexcept {
     };
 }
 
-// A full inbound ring is normal backpressure, not a replay error. The producer
-// keeps ownership of the message and retries until it is accepted.
+// A full inbound ring is normal backpressure, not a replay error. The
+// producer keeps ownership of the message and retries until it is accepted.
 template <std::size_t RingCapacity>
 void push_replayed_msg(SpscRing<InboundMsg, RingCapacity>& inbound, const InboundMsg& msg,
                        TraceReplayResult& result, ReplayWaitMode wait_mode) noexcept {

@@ -36,6 +36,10 @@ add_executable(trace_replay_test trace_replay_test.cpp)
 target_link_libraries(trace_replay_test PRIVATE orderbook_codec)
 add_test(NAME trace_replay_test COMMAND trace_replay_test)
 
+add_executable(synthetic_generator_test synthetic_generator_test.cpp)
+target_link_libraries(synthetic_generator_test PRIVATE orderbook_core)
+add_test(NAME synthetic_generator_test COMMAND synthetic_generator_test)
+
 add_executable(matching_loop_test matching_loop_test.cpp)
 target_link_libraries(matching_loop_test PRIVATE orderbook_core)
 add_test(NAME matching_loop_test COMMAND matching_loop_test)

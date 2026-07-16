@@ -1,5 +1,10 @@
 # tools/
 
-Offline trace generation and text-to-trace conversion tools will live here.
-These tools are intended for deterministic replay, hand-written scenarios, and
-benchmark input generation.
+Small offline tools for creating saved command files.
+
+`text_to_saved_commands` converts hand-written text commands into the binary
+format consumed by trace replay.
+
+`generate_saved_commands` creates a seeded synthetic command file. It runs the
+matcher synchronously while generating commands so later cancel commands can use
+real handles assigned by earlier accepted orders.
