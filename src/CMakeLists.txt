@@ -1,3 +1,2 @@
-# The core library is header-only for now. Implementation files for the pool,
-# book, matching engine, and codec will be added here as those components are
-# built.
+add_library(orderbook_codec STATIC codec.cpp)
+target_link_libraries(orderbook_codec PUBLIC orderbook_core)

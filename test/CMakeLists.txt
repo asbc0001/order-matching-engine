@@ -24,6 +24,10 @@ if(CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
   endif()
 endif()
 
+add_executable(codec_test codec_test.cpp)
+target_link_libraries(codec_test PRIVATE orderbook_codec)
+add_test(NAME codec_test COMMAND codec_test)
+
 add_executable(book_test book_test.cpp)
 target_link_libraries(book_test PRIVATE orderbook_core)
 add_test(NAME book_test COMMAND book_test)
