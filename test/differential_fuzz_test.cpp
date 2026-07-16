@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "orderbook/book_dump.hpp"
 #include "orderbook/config.hpp"
 #include "orderbook/matcher.hpp"
 #include "orderbook/types.hpp"
@@ -473,6 +474,8 @@ bool process_and_check(Engine& engine, Reference& reference, FuzzerState& state,
         for (const ob::OutboundEvent& event : reference_sink.events) {
             print_event("reference event=", event);
         }
+        std::fprintf(stderr, "engine final book:\n");
+        (void)ob::dump_book(engine.book(), stderr);
         return false;
     }
     return true;

@@ -18,6 +18,7 @@
 #include <sched.h>
 #endif
 
+#include "orderbook/book_dump.hpp"
 #include "orderbook/config.hpp"
 #include "orderbook/demo_renderer.hpp"
 #include "orderbook/event_logger.hpp"
@@ -50,6 +51,7 @@ struct CoreConfig {
 struct Options {
     const char* input_path{nullptr};
     const char* log_path{nullptr};
+    const char* book_path{nullptr};
     OutputMode output_mode{OutputMode::Memory};
     ob::WaitMode wait_mode{ob::WaitMode::Spin};
     CoreConfig cores{};
@@ -66,7 +68,7 @@ struct LoggerStats {
 int usage(const char* program) {
     std::fprintf(stderr,
                  "usage: %s <saved.commands> [--memory|--log <file>|--demo] [--yield] "
-                 "[--cores producer,matcher,logger]\n",
+                 "[--cores producer,matcher,logger] [--book <file>]\n",
                  program);
     return 2;
 }
@@ -120,6 +122,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (i + 1 >= argc || !parse_core_triple(argv[++i], options.cores)) {
                 return false;
             }
+        } else if (arg == "--book") {
+            if (i + 1 >= argc) {
+                return false;
+            }
+            options.book_path = argv[++i];
         } else {
             return false;
         }
@@ -254,6 +261,28 @@ struct MemorySinkAdapter {
     }
 };
 
+bool write_final_book(const EngineLoop& loop, const char* path) {
+    if (path == nullptr) {
+        return true;
+    }
+
+    std::FILE* file = std::fopen(path, "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "failed to open book dump '%s': %s\n", path, std::strerror(errno));
+        return false;
+    }
+
+    // The matching thread has already joined before this is called, so reading
+    // the book here has no concurrent writer.
+    const bool ok = ob::dump_book(loop.matcher().book(), file);
+    const bool close_ok = std::fclose(file) == 0;
+    if (!ok || !close_ok) {
+        std::fprintf(stderr, "failed to write book dump '%s'\n", path);
+        return false;
+    }
+    return true;
+}
+
 int run_engine(const Options& options) {
     // These objects contain large fixed arrays. Allocate them once here instead
     // of putting them on a thread stack.
@@ -335,6 +364,9 @@ int run_engine(const Options& options) {
     }
     if (!pinning_ok.load(std::memory_order_relaxed)) {
         std::fprintf(stderr, "engine completed, but at least one requested core pin failed\n");
+        return 1;
+    }
+    if (!write_final_book(*loop, options.book_path)) {
         return 1;
     }
 

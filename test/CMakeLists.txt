@@ -56,6 +56,10 @@ add_executable(book_test book_test.cpp)
 target_link_libraries(book_test PRIVATE orderbook_core)
 add_test(NAME book_test COMMAND book_test)
 
+add_executable(book_dump_test book_dump_test.cpp)
+target_link_libraries(book_dump_test PRIVATE orderbook_core)
+add_test(NAME book_dump_test COMMAND book_dump_test)
+
 add_executable(matcher_test matcher_test.cpp)
 target_link_libraries(matcher_test PRIVATE orderbook_core)
 add_test(NAME matcher_test COMMAND matcher_test)
