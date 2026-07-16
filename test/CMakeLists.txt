@@ -28,6 +28,14 @@ add_executable(codec_test codec_test.cpp)
 target_link_libraries(codec_test PRIVATE orderbook_codec)
 add_test(NAME codec_test COMMAND codec_test)
 
+add_executable(text_trace_parser_test text_trace_parser_test.cpp)
+target_link_libraries(text_trace_parser_test PRIVATE orderbook_trace_parser)
+add_test(NAME text_trace_parser_test COMMAND text_trace_parser_test)
+
+add_executable(trace_replay_test trace_replay_test.cpp)
+target_link_libraries(trace_replay_test PRIVATE orderbook_codec)
+add_test(NAME trace_replay_test COMMAND trace_replay_test)
+
 add_executable(matching_loop_test matching_loop_test.cpp)
 target_link_libraries(matching_loop_test PRIVATE orderbook_core)
 add_test(NAME matching_loop_test COMMAND matching_loop_test)

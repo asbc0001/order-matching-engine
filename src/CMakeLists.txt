@@ -1,2 +1,5 @@
 add_library(orderbook_codec STATIC codec.cpp)
 target_link_libraries(orderbook_codec PUBLIC orderbook_core)
+
+add_library(orderbook_trace_parser STATIC text_trace_parser.cpp)
+target_link_libraries(orderbook_trace_parser PUBLIC orderbook_core)
