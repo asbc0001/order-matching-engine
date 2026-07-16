@@ -17,6 +17,7 @@
 
 #include "orderbook/matcher.hpp"
 #include "orderbook/spsc_ring.hpp"
+#include "orderbook/time.hpp"
 #include "orderbook/types.hpp"
 
 namespace ob {
@@ -73,9 +74,11 @@ class MatchingLoop {
 
             ++stats.processed;
             auto sink = [&](const OutboundEvent& event) noexcept {
+                OutboundEvent stamped_event = event;
+                stamped_event.tsc_egress = engine_time_nanos();
                 // The matching thread owns the event until the outbound ring
                 // accepts it; no event is dropped when the logger falls behind.
-                while (!outbound_.push(event)) {
+                while (!outbound_.push(stamped_event)) {
                     ++stats.outbound_full_waits;
                     matching_loop_wait(wait_mode);
                 }

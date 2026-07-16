@@ -8,3 +8,6 @@ format consumed by trace replay.
 `generate_saved_commands` creates a seeded synthetic command file. It runs the
 matcher synchronously while generating commands so later cancel commands can use
 real handles assigned by earlier accepted orders.
+
+`run_engine` replays a saved command file through the threaded engine. It can
+write memory counters, a deterministic event log, or a simple terminal demo.

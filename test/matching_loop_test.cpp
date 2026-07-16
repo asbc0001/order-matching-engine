@@ -65,6 +65,9 @@ bool check_loop_forwards_matcher_events_and_stop() {
         event.client_seq != 1 || event.qty != 10) {
         return fail("Resting ack event mismatch");
     }
+    if (event.tsc_egress == 0) {
+        return fail("Matching loop did not stamp event egress time");
+    }
 
     if (!pop_event(outbound, event) || event.type != ob::EventType::Fill || event.client_seq != 1 ||
         event.qty != 4 || event.flags != 0) {

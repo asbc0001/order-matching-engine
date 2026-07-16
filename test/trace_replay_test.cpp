@@ -114,6 +114,10 @@ bool check_success_replays_messages_and_stop() {
         out.price != 101 || out.qty != 5) {
         return fail("First replayed message mismatch");
     }
+    if (out.tsc_intended == 0 || out.tsc_ready < out.tsc_intended ||
+        out.tsc_enqueue < out.tsc_ready) {
+        return fail("Producer timestamps were not populated");
+    }
     if (!inbound.pop(out) || out.client_seq != 11 || out.type != ob::MsgType::Cancel ||
         out.handle != 1234) {
         return fail("Second replayed message mismatch");

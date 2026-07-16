@@ -3,3 +3,6 @@ target_link_libraries(text_to_saved_commands PRIVATE orderbook_codec orderbook_t
 
 add_executable(generate_saved_commands generate_saved_commands.cpp)
 target_link_libraries(generate_saved_commands PRIVATE orderbook_codec orderbook_core)
+
+add_executable(run_engine run_engine.cpp)
+target_link_libraries(run_engine PRIVATE orderbook_codec orderbook_core)

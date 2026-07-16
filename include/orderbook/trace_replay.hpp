@@ -20,6 +20,7 @@
 
 #include "orderbook/codec.hpp"
 #include "orderbook/spsc_ring.hpp"
+#include "orderbook/time.hpp"
 #include "orderbook/types.hpp"
 
 namespace ob::trace {
@@ -174,9 +175,16 @@ inline InboundMsg make_stop_engine_msg(std::uint64_t client_seq) noexcept {
 // A full inbound ring is normal backpressure, not a replay error. The
 // producer keeps ownership of the message and retries until it is accepted.
 template <std::size_t RingCapacity>
-void push_replayed_msg(SpscRing<InboundMsg, RingCapacity>& inbound, const InboundMsg& msg,
+void push_replayed_msg(SpscRing<InboundMsg, RingCapacity>& inbound, const InboundMsg& input,
                        TraceReplayResult& result, ReplayWaitMode wait_mode) noexcept {
-    while (!inbound.push(msg)) {
+    InboundMsg msg = input;
+    msg.tsc_intended = engine_time_nanos();
+    msg.tsc_ready = engine_time_nanos();
+    for (;;) {
+        msg.tsc_enqueue = engine_time_nanos();
+        if (inbound.push(msg)) {
+            return;
+        }
         ++result.inbound_full_waits;
         trace_replay_wait(wait_mode);
     }
