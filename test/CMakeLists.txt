@@ -40,6 +40,14 @@ add_executable(synthetic_generator_test synthetic_generator_test.cpp)
 target_link_libraries(synthetic_generator_test PRIVATE orderbook_core)
 add_test(NAME synthetic_generator_test COMMAND synthetic_generator_test)
 
+add_executable(event_logger_test event_logger_test.cpp)
+target_link_libraries(event_logger_test PRIVATE orderbook_core)
+add_test(NAME event_logger_test COMMAND event_logger_test)
+
+add_executable(demo_renderer_test demo_renderer_test.cpp)
+target_link_libraries(demo_renderer_test PRIVATE orderbook_core)
+add_test(NAME demo_renderer_test COMMAND demo_renderer_test)
+
 add_executable(matching_loop_test matching_loop_test.cpp)
 target_link_libraries(matching_loop_test PRIVATE orderbook_core)
 add_test(NAME matching_loop_test COMMAND matching_loop_test)
