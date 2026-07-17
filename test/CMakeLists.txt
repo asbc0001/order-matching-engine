@@ -13,7 +13,7 @@ add_test(NAME spsc_ring_test COMMAND spsc_ring_test)
 
 add_executable(spsc_ring_stress spsc_ring_stress.cpp)
 target_link_libraries(spsc_ring_stress PRIVATE orderbook_core)
-add_test(NAME spsc_ring_stress_smoke COMMAND spsc_ring_stress 100000)
+add_test(NAME spsc_ring_stress_short COMMAND spsc_ring_stress 100000)
 if(CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
   find_program(SETARCH_EXE setarch)
   if(SETARCH_EXE)
@@ -68,6 +68,10 @@ add_executable(differential_fuzz_test differential_fuzz_test.cpp)
 target_link_libraries(differential_fuzz_test PRIVATE orderbook_core)
 add_test(NAME differential_fuzz_test COMMAND differential_fuzz_test)
 
+add_executable(threaded_differential_pipeline_test threaded_differential_pipeline_test.cpp)
+target_link_libraries(threaded_differential_pipeline_test PRIVATE orderbook_core)
+add_test(NAME threaded_differential_pipeline_test COMMAND threaded_differential_pipeline_test)
+
 add_test(
   NAME deterministic_replay_test
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/deterministic_replay_test.sh
@@ -80,4 +84,17 @@ add_test(
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cancel_heavy_replay_test.sh
           $<TARGET_FILE:generate_saved_commands>
           $<TARGET_FILE:run_engine>
+)
+
+add_test(
+  NAME demo_mode_test
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/demo_mode_test.sh
+          $<TARGET_FILE:text_to_saved_commands>
+          $<TARGET_FILE:run_engine>
+)
+
+add_test(
+  NAME engine_bench_run_test
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/engine_bench_run_test.sh
+          $<TARGET_FILE:engine_bench>
 )

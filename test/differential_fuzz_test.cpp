@@ -564,7 +564,7 @@ bool check_seeded_differential_fuzz(bool production_profile) {
         }
     }
 
-    // Short explicit runs are useful for smoke checks and exact replay; the
+    // Short explicit runs are useful for reduced checks and exact replay; the
     // normal configured run still has to prove it hit the required paths.
     if (has_env_value("OB_FUZZ_OPS") || has_env_value("OB_FUZZ_SEED")) {
         return true;

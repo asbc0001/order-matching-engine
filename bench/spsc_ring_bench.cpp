@@ -210,7 +210,7 @@ bool should_run(std::string_view selected, std::string_view name) noexcept {
 }
 
 // Pinning reduces scheduler noise when the host exposes stable CPUs. The
-// benchmark still works as a correctness-preserving smoke run without claiming
+// benchmark still works as a small correctness-preserving run without claiming
 // final publishable timing on noisy environments.
 bool pin_current_thread(int cpu, const char* name) {
 #if defined(__linux__)
