@@ -1,4 +1,4 @@
-// codec.hpp - Stable byte format for order-book messages and events.
+// codec.hpp - Convert engine commands and events to/from saved binary records.
 //
 // The in-memory structs are padded and carry timing fields. The codec writes
 // only the logical fields at fixed offsets, so traces and logs do not depend on
@@ -29,6 +29,7 @@ enum class DecodeError : std::uint8_t {
     BadRecordKind,
     InvalidSide,
     InvalidMsgType,
+    InvalidTimeInForce,
     InvalidEventType,
     InvalidRejectReason,
     InvalidFlags,

@@ -22,10 +22,19 @@ enum class MsgType : uint8_t {
     StopEngine  // Internal-only shutdown sentinel; external decoders must reject it.
 };
 
-using Price = int64_t;    // integer ticks: no floats in matching state/decisions
-using Qty = uint32_t;     // per-order quantity
-using AggQty = uint64_t;  // aggregate quantity
-using Handle = uint64_t;  // (generation << 32) | pool_slot; 0 is never valid
+// Limit-order lifetime. GTC is zero so older saved command files, whose unused
+// bytes decode as zero, keep their original "rest any remainder" behavior.
+enum class TimeInForce : uint8_t {
+    GTC = 0,  // Good-till-cancel: match now, then rest any remaining quantity.
+    IOC = 1,  // Immediate-or-cancel: match now, reject any remaining quantity.
+    FOK = 2,  // Fill-or-kill: fill the whole quantity now, or do nothing.
+};
+
+using Price = int64_t;           // integer ticks: no floats in matching state/decisions
+using Qty = uint32_t;            // per-order quantity
+using AggQty = uint64_t;         // aggregate quantity
+using Handle = uint64_t;         // (generation << 32) | pool_slot; 0 is never valid
+using ParticipantId = uint32_t;  // trading identity used for self-trade checks
 
 // Command submitted to the matching engine. Producers write these into the
 // inbound ring; the matching thread consumes them in sequence.
@@ -36,6 +45,8 @@ struct alignas(64) InboundMsg {  // one cache line, internal representation
     Qty qty;
     Side side;
     MsgType type;
+    TimeInForce time_in_force{TimeInForce::GTC};
+    ParticipantId participant_id{0};
     uint64_t tsc_intended;  // open-loop: scheduled arrival t_i
     uint64_t tsc_ready;     // producer reached the push attempt
     uint64_t tsc_enqueue;   // ring accepted the message
@@ -60,8 +71,10 @@ enum class RejectReason : uint8_t {
     ZeroQty,
     PoolExhausted,
     UnknownHandle,
-    InsufficientLiquidity  // market order remainder unfilled; qty carries
-                           // the unfilled remainder
+    InsufficientLiquidity,       // market order remainder unfilled; qty carries the remainder
+    ImmediateOrCancelRemainder,  // IOC matched what it could and rejected the rest
+    FillOrKillNotFilled,         // FOK could not fill the full requested quantity
+    SelfTrade                    // aggressing order would trade against the same participant
 };
 
 enum EventFlags : uint8_t { RequestComplete = 1 << 0 };
@@ -93,6 +106,7 @@ struct alignas(64) Order {
     Handle handle;        // Cleared to 0 on free so stale handles fail lookup.
     Price price;
     Qty remaining;
+    ParticipantId participant_id{0};
     Side side;
     uint32_t prev, next;  // pool slot indices, not pointers
 };
@@ -111,9 +125,11 @@ static_assert(std::is_trivially_copyable_v<Order>);
 
 static_assert(std::is_same_v<std::underlying_type_t<Side>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<MsgType>, uint8_t>);
+static_assert(std::is_same_v<std::underlying_type_t<TimeInForce>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<EventType>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<RejectReason>, uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<EventFlags>, uint8_t>);
+static_assert(sizeof(ParticipantId) == 4);
 
 static_assert(alignof(InboundMsg) == 64);
 static_assert(alignof(OutboundEvent) == 64);

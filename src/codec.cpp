@@ -1,3 +1,9 @@
+// codec.cpp - Convert engine commands and events to/from saved binary records.
+//
+// The engine's in-memory structs contain padding and timing fields, so this
+// file writes each meaningful field at a named offset instead of copying raw
+// struct bytes. That keeps saved files stable across compilers and runs.
+
 #include "orderbook/codec.hpp"
 
 #include <cstddef>
@@ -27,6 +33,8 @@ constexpr std::size_t QTY = 32;
 constexpr std::size_t SIDE = 36;
 
 constexpr std::size_t INBOUND_TYPE = 37;
+constexpr std::size_t INBOUND_TIME_IN_FORCE = 38;
+constexpr std::size_t INBOUND_PARTICIPANT_ID = 40;
 
 constexpr std::size_t OUTBOUND_TYPE = 37;
 constexpr std::size_t OUTBOUND_REASON = 38;
@@ -112,6 +120,12 @@ bool valid_external_msg_type(std::uint8_t value) noexcept {
            value == static_cast<std::uint8_t>(MsgType::Cancel);
 }
 
+bool valid_time_in_force(std::uint8_t value) noexcept {
+    return value == static_cast<std::uint8_t>(TimeInForce::GTC) ||
+           value == static_cast<std::uint8_t>(TimeInForce::IOC) ||
+           value == static_cast<std::uint8_t>(TimeInForce::FOK);
+}
+
 // StopEngine events are useful between engine threads, but replayable logs only
 // contain trading events.
 bool valid_external_event_type(std::uint8_t value) noexcept {
@@ -122,7 +136,7 @@ bool valid_external_event_type(std::uint8_t value) noexcept {
 }
 
 bool valid_reject_reason(std::uint8_t value) noexcept {
-    return value <= static_cast<std::uint8_t>(RejectReason::InsufficientLiquidity);
+    return value <= static_cast<std::uint8_t>(RejectReason::SelfTrade);
 }
 
 }  // namespace
@@ -138,6 +152,8 @@ EncodedInbound encode_inbound(const InboundMsg& msg) noexcept {
     write_u32(bytes, offset::QTY, msg.qty);
     bytes[offset::SIDE] = static_cast<std::uint8_t>(msg.side);
     bytes[offset::INBOUND_TYPE] = static_cast<std::uint8_t>(msg.type);
+    bytes[offset::INBOUND_TIME_IN_FORCE] = static_cast<std::uint8_t>(msg.time_in_force);
+    write_u32(bytes, offset::INBOUND_PARTICIPANT_ID, msg.participant_id);
     return bytes;
 }
 
@@ -152,6 +168,9 @@ DecodeResult<InboundMsg> decode_inbound(std::span<const std::uint8_t> bytes) noe
     if (!valid_external_msg_type(bytes[offset::INBOUND_TYPE])) {
         return {.error = DecodeError::InvalidMsgType};
     }
+    if (!valid_time_in_force(bytes[offset::INBOUND_TIME_IN_FORCE])) {
+        return {.error = DecodeError::InvalidTimeInForce};
+    }
 
     // Decoded timing fields start empty and are filled by the producer/engine
     // when this command is run again.
@@ -164,6 +183,8 @@ DecodeResult<InboundMsg> decode_inbound(std::span<const std::uint8_t> bytes) noe
                 .qty = read_u32(bytes, offset::QTY),
                 .side = static_cast<Side>(bytes[offset::SIDE]),
                 .type = static_cast<MsgType>(bytes[offset::INBOUND_TYPE]),
+                .time_in_force = static_cast<TimeInForce>(bytes[offset::INBOUND_TIME_IN_FORCE]),
+                .participant_id = read_u32(bytes, offset::INBOUND_PARTICIPANT_ID),
                 .tsc_intended = 0,
                 .tsc_ready = 0,
                 .tsc_enqueue = 0,
@@ -243,6 +264,8 @@ const char* decode_error_name(DecodeError error) noexcept {
             return "InvalidSide";
         case DecodeError::InvalidMsgType:
             return "InvalidMsgType";
+        case DecodeError::InvalidTimeInForce:
+            return "InvalidTimeInForce";
         case DecodeError::InvalidEventType:
             return "InvalidEventType";
         case DecodeError::InvalidRejectReason:

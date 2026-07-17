@@ -33,6 +33,8 @@ ob::InboundMsg inbound_sample() {
         .qty = 42,
         .side = ob::Side::Ask,
         .type = ob::MsgType::NewLimit,
+        .time_in_force = ob::TimeInForce::FOK,
+        .participant_id = 0x31323334u,
         .tsc_intended = 100,
         .tsc_ready = 200,
         .tsc_enqueue = 300,
@@ -62,7 +64,9 @@ bool check_inbound_round_trip_and_offsets() {
     // and C++ struct padding.
     if (bytes[8] != 0x08 || bytes[9] != 0x07 || bytes[10] != 0x06 || bytes[11] != 0x05 ||
         bytes[36] != static_cast<std::uint8_t>(ob::Side::Ask) ||
-        bytes[37] != static_cast<std::uint8_t>(ob::MsgType::NewLimit)) {
+        bytes[37] != static_cast<std::uint8_t>(ob::MsgType::NewLimit) ||
+        bytes[38] != static_cast<std::uint8_t>(ob::TimeInForce::FOK) || bytes[40] != 0x34 ||
+        bytes[41] != 0x33 || bytes[42] != 0x32 || bytes[43] != 0x31) {
         return fail("Inbound fixed offsets failed");
     }
 
@@ -73,7 +77,8 @@ bool check_inbound_round_trip_and_offsets() {
 
     const ob::InboundMsg& out = decoded.value;
     if (out.client_seq != msg.client_seq || out.handle != msg.handle || out.price != msg.price ||
-        out.qty != msg.qty || out.side != msg.side || out.type != msg.type) {
+        out.qty != msg.qty || out.side != msg.side || out.type != msg.type ||
+        out.time_in_force != msg.time_in_force || out.participant_id != msg.participant_id) {
         return fail("Inbound round trip changed logical fields");
     }
     if (out.tsc_intended != 0 || out.tsc_ready != 0 || out.tsc_enqueue != 0) {
@@ -135,9 +140,17 @@ bool check_inbound_validation() {
 
     bytes = ob::codec::encode_inbound(inbound_sample());
     bytes[37] = static_cast<std::uint8_t>(ob::MsgType::StopEngine);
+    if (!expect_error(ob::codec::decode_inbound(bytes).error,
+                      ob::codec::DecodeError::InvalidMsgType,
+                      "Inbound StopEngine rejection failed")) {
+        return false;
+    }
+
+    bytes = ob::codec::encode_inbound(inbound_sample());
+    bytes[38] = 99;
     return expect_error(ob::codec::decode_inbound(bytes).error,
-                        ob::codec::DecodeError::InvalidMsgType,
-                        "Inbound StopEngine rejection failed");
+                        ob::codec::DecodeError::InvalidTimeInForce,
+                        "Inbound time-in-force check failed");
 }
 
 bool check_outbound_validation() {

@@ -102,6 +102,12 @@ inline const char* reject_reason_name(RejectReason reason) noexcept {
             return "UnknownHandle";
         case RejectReason::InsufficientLiquidity:
             return "InsufficientLiquidity";
+        case RejectReason::ImmediateOrCancelRemainder:
+            return "ImmediateOrCancelRemainder";
+        case RejectReason::FillOrKillNotFilled:
+            return "FillOrKillNotFilled";
+        case RejectReason::SelfTrade:
+            return "SelfTrade";
     }
     return "UnknownRejectReason";
 }
