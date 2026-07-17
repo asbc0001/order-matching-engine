@@ -60,6 +60,42 @@ bool check_observed_ack_new_enables_valid_cancel() {
                : fail("Valid cancel failed");
 }
 
+bool check_valid_cancel_mode_creates_real_cancel_path() {
+    ob::synthetic::GeneratorConfig valid_cancel_only{
+        .limit_weight = 0,
+        .market_weight = 0,
+        .cancel_weight = 1,
+        .valid_cancels_only = true,
+    };
+    Generator generator{7, valid_cancel_only};
+
+    // With no known handles yet, the generator must create a real resting
+    // limit order first. A forged cancel would fail the replay gate.
+    const ob::InboundMsg setup = generator.next(1);
+    if (setup.type != ob::MsgType::NewLimit || setup.qty == 0) {
+        return fail("Valid-cancel mode did not create a setup limit");
+    }
+
+    constexpr ob::Handle kHandle = 0x300000001ULL;
+    generator.observe(ob::OutboundEvent{
+        .client_seq = setup.client_seq,
+        .handle = kHandle,
+        .price = setup.price,
+        .qty = setup.qty,
+        .side = setup.side,
+        .type = ob::EventType::AckNew,
+        .reason = ob::RejectReason::None,
+        .flags = ob::RequestComplete,
+        .tsc_intended = 0,
+        .tsc_egress = 0,
+    });
+
+    const ob::InboundMsg cancel = generator.next(2);
+    return cancel.type == ob::MsgType::Cancel && cancel.handle == kHandle
+               ? true
+               : fail("Valid-cancel mode did not use the observed handle");
+}
+
 bool check_fill_removes_exhausted_handle() {
     Generator generator{9};
     constexpr ob::Handle kHandle = 0x200000001ULL;
@@ -96,9 +132,10 @@ bool check_fill_removes_exhausted_handle() {
 
 int main() {
     using Check = bool (*)();
-    constexpr std::array<Check, 3> checks{
+    constexpr std::array<Check, 4> checks{
         check_same_seed_repeats_stream,
         check_observed_ack_new_enables_valid_cancel,
+        check_valid_cancel_mode_creates_real_cancel_path,
         check_fill_removes_exhausted_handle,
     };
 

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string_view>
 
 #include "orderbook/codec.hpp"
 #include "orderbook/config.hpp"
@@ -48,17 +49,18 @@ bool write_bytes(std::FILE* file, const std::uint8_t* bytes, std::size_t size, c
     return true;
 }
 
-// Keep the interface minimal: output path, number of commands, and seed fully
-// define a repeatable generated command file.
+// Keep the interface minimal: output path, number of commands, seed, and an
+// optional workload mode fully define a repeatable generated command file.
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s <output.commands> <command_count> <seed>\n", program);
+    std::fprintf(stderr, "usage: %s <output.commands> <command_count> <seed> [--cancel-heavy]\n",
+                 program);
     return 2;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         return usage(argv[0]);
     }
 
@@ -66,6 +68,21 @@ int main(int argc, char** argv) {
     std::uint64_t seed = 0;
     if (!parse_u64(argv[2], command_count) || command_count == 0 || !parse_u64(argv[3], seed)) {
         return usage(argv[0]);
+    }
+
+    ob::synthetic::GeneratorConfig config;
+    if (argc == 5) {
+        if (std::string_view{argv[4]} != "--cancel-heavy") {
+            return usage(argv[0]);
+        }
+        // Bias toward cancels while still generating enough new limits for the
+        // generator to learn real live handles from matcher output.
+        config = ob::synthetic::GeneratorConfig{
+            .limit_weight = 50,
+            .market_weight = 0,
+            .cancel_weight = 50,
+            .valid_cancels_only = true,
+        };
     }
 
     std::FILE* output = std::fopen(argv[1], "wb");
@@ -82,7 +99,7 @@ int main(int argc, char** argv) {
     }
 
     auto matcher = std::make_unique<ToolMatcher>();
-    ToolGenerator generator{seed};
+    ToolGenerator generator{seed, config};
 
     // The matcher run is only for handle discovery. The written file still
     // contains commands, not matcher output.

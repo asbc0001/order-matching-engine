@@ -23,6 +23,10 @@ struct GeneratorConfig {
     std::uint8_t limit_weight{70};
     std::uint8_t market_weight{20};
     std::uint8_t cancel_weight{10};
+    // When true, CANCEL commands are only made from handles learned through
+    // observe(). This is used for saved command files that should replay
+    // without UnknownHandle rejects.
+    bool valid_cancels_only{false};
 };
 
 template <std::size_t NumLevels, std::size_t MaxTrackedHandles,
@@ -41,11 +45,17 @@ class CommandGenerator {
         const std::uint64_t pick = total_weight == 0 ? 0 : rng_() % total_weight;
 
         if (pick < config_.limit_weight) {
+            if (config_.valid_cancels_only) {
+                return safe_resting_limit(client_seq);
+            }
             return make_msg(client_seq, MsgType::NewLimit, random_side(), random_price(),
                             random_qty());
         }
         if (pick < static_cast<std::uint64_t>(config_.limit_weight) + config_.market_weight) {
             return make_msg(client_seq, MsgType::NewMarket, random_side(), 0, random_qty());
+        }
+        if (config_.valid_cancels_only && live_count_ == 0) {
+            return safe_resting_limit(client_seq);
         }
         return random_cancel(client_seq);
     }
@@ -135,9 +145,29 @@ class CommandGenerator {
         }
     }
 
+    // The cancel-heavy saved-command path needs setup orders that really rest
+    // in the book. These prices stay inside the configured band and away from
+    // each other, so generated bids and asks do not immediately cross.
+    InboundMsg safe_resting_limit(std::uint64_t client_seq) noexcept {
+        static_assert(NumLevels >= 2, "valid cancel generation needs at least two price levels");
+
+        const Side side = random_side();
+        const std::size_t bid_index = NumLevels / 3;
+        const std::size_t ask_index = (2 * NumLevels) / 3;
+        const std::size_t price_index = side == Side::Bid ? bid_index : ask_index;
+        const Qty qty = static_cast<Qty>((rng_() % 200) + 1);
+        return make_msg(client_seq, MsgType::NewLimit, side,
+                        BasePrice + static_cast<Price>(price_index), qty);
+    }
+
     // Prefer real live handles when observe() has seen them. Otherwise generate
     // stale/null/forged handles to keep UnknownHandle paths active.
     InboundMsg random_cancel(std::uint64_t client_seq) noexcept {
+        if (config_.valid_cancels_only && live_count_ > 0) {
+            const std::size_t idx = static_cast<std::size_t>(rng_() % live_count_);
+            return make_msg(client_seq, MsgType::Cancel, Side::Bid, 0, 0, live_[idx].handle);
+        }
+
         const std::uint64_t mode = rng_() % 10;
         if (mode < 6 && live_count_ > 0) {
             const std::size_t idx = static_cast<std::size_t>(rng_() % live_count_);

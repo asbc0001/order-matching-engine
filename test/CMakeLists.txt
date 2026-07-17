@@ -67,3 +67,17 @@ add_test(NAME matcher_test COMMAND matcher_test)
 add_executable(differential_fuzz_test differential_fuzz_test.cpp)
 target_link_libraries(differential_fuzz_test PRIVATE orderbook_core)
 add_test(NAME differential_fuzz_test COMMAND differential_fuzz_test)
+
+add_test(
+  NAME deterministic_replay_test
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/deterministic_replay_test.sh
+          $<TARGET_FILE:generate_saved_commands>
+          $<TARGET_FILE:run_engine>
+)
+
+add_test(
+  NAME cancel_heavy_replay_test
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cancel_heavy_replay_test.sh
+          $<TARGET_FILE:generate_saved_commands>
+          $<TARGET_FILE:run_engine>
+)
