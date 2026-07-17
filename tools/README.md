@@ -13,10 +13,14 @@ Converts a hand-written text file into a saved command file.
 Input grammar:
 
 ```text
-LIMIT <BID|ASK> <price> <qty>
+LIMIT <BID|ASK> <price> <qty> [GTC|IOC|FOK] [PARTICIPANT=<id>]
 MARKET <BID|ASK> <qty>
 CANCEL <handle>
 ```
+
+`GTC` is the default limit-order behavior when the token is omitted.
+`PARTICIPANT=0` or an omitted participant means no participant was assigned,
+so self-trade prevention is not applied to that command.
 
 Usage:
 

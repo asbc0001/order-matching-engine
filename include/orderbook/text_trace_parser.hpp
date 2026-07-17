@@ -21,6 +21,8 @@ enum class ParseError : std::uint8_t {
     BadPrice,
     BadQty,
     BadHandle,
+    BadTimeInForce,
+    BadParticipant,
     WrongFieldCount,
 };
 

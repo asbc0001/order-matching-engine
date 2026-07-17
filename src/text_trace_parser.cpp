@@ -10,7 +10,7 @@ namespace ob::trace {
 namespace {
 
 struct Tokens {
-    std::string_view values[4]{};
+    std::string_view values[6]{};
     std::size_t count{0};
     bool too_many{false};
 };
@@ -60,6 +60,22 @@ bool parse_side(std::string_view token, Side& side) noexcept {
     return false;
 }
 
+bool parse_time_in_force(std::string_view token, TimeInForce& time_in_force) noexcept {
+    if (token == "GTC") {
+        time_in_force = TimeInForce::GTC;
+        return true;
+    }
+    if (token == "IOC") {
+        time_in_force = TimeInForce::IOC;
+        return true;
+    }
+    if (token == "FOK") {
+        time_in_force = TimeInForce::FOK;
+        return true;
+    }
+    return false;
+}
+
 template <typename Int>
 bool parse_int(std::string_view token, Int& value) noexcept {
     if (token.empty()) {
@@ -80,6 +96,22 @@ bool parse_int(std::string_view token, Int& value) noexcept {
     return true;
 }
 
+bool parse_participant(std::string_view token, ParticipantId& participant_id) noexcept {
+    constexpr std::string_view kPrefix = "PARTICIPANT=";
+    if (!token.starts_with(kPrefix)) {
+        return false;
+    }
+
+    std::uint64_t parsed = 0;
+    const std::string_view number = token.substr(kPrefix.size());
+    if (!parse_int(number, parsed) || parsed > std::numeric_limits<ParticipantId>::max()) {
+        return false;
+    }
+
+    participant_id = static_cast<ParticipantId>(parsed);
+    return true;
+}
+
 // Parse wide first so oversized quantities are rejected cleanly before the
 // final narrowing cast to Qty.
 bool parse_qty(std::string_view token, Qty& qty) noexcept {
@@ -93,7 +125,8 @@ bool parse_qty(std::string_view token, Qty& qty) noexcept {
 }
 
 InboundMsg make_msg(std::uint64_t client_seq, MsgType type, Side side, Price price, Qty qty,
-                    Handle handle = 0) noexcept {
+                    Handle handle = 0, TimeInForce time_in_force = TimeInForce::GTC,
+                    ParticipantId participant_id = 0) noexcept {
     return InboundMsg{
         .client_seq = client_seq,
         .handle = handle,
@@ -101,6 +134,8 @@ InboundMsg make_msg(std::uint64_t client_seq, MsgType type, Side side, Price pri
         .qty = qty,
         .side = side,
         .type = type,
+        .time_in_force = time_in_force,
+        .participant_id = participant_id,
         .tsc_intended = 0,
         .tsc_ready = 0,
         .tsc_enqueue = 0,
@@ -121,13 +156,15 @@ ParseResult parse_line(std::uint64_t client_seq, std::string_view line) noexcept
     }
 
     if (tokens.values[0] == "LIMIT") {
-        if (tokens.count != 4) {
+        if (tokens.count < 4) {
             return {.error = ParseError::WrongFieldCount};
         }
 
         Side side{};
         Price price = 0;
         Qty qty = 0;
+        TimeInForce time_in_force = TimeInForce::GTC;
+        ParticipantId participant_id = 0;
         if (!parse_side(tokens.values[1], side)) {
             return {.error = ParseError::BadSide};
         }
@@ -138,7 +175,38 @@ ParseResult parse_line(std::uint64_t client_seq, std::string_view line) noexcept
             return {.error = ParseError::BadQty};
         }
 
-        return {.value = make_msg(client_seq, MsgType::NewLimit, side, price, qty),
+        // LIMIT accepts optional trailing fields in any order:
+        //   GTC / IOC / FOK
+        //   PARTICIPANT=<id>
+        // Omitted fields default to GTC and participant 0.
+        bool saw_time_in_force = false;
+        bool saw_participant = false;
+        for (std::size_t i = 4; i < tokens.count; ++i) {
+            TimeInForce parsed_time_in_force{};
+            ParticipantId parsed_participant = 0;
+            if (parse_time_in_force(tokens.values[i], parsed_time_in_force)) {
+                if (saw_time_in_force) {
+                    return {.error = ParseError::BadTimeInForce};
+                }
+                time_in_force = parsed_time_in_force;
+                saw_time_in_force = true;
+                continue;
+            }
+            if (parse_participant(tokens.values[i], parsed_participant)) {
+                if (saw_participant) {
+                    return {.error = ParseError::BadParticipant};
+                }
+                participant_id = parsed_participant;
+                saw_participant = true;
+                continue;
+            }
+            return tokens.values[i].starts_with("PARTICIPANT=")
+                       ? ParseResult{.error = ParseError::BadParticipant}
+                       : ParseResult{.error = ParseError::BadTimeInForce};
+        }
+
+        return {.value = make_msg(client_seq, MsgType::NewLimit, side, price, qty, 0, time_in_force,
+                                  participant_id),
                 .error = ParseError::None};
     }
 
@@ -193,6 +261,10 @@ const char* parse_error_name(ParseError error) noexcept {
             return "BadQty";
         case ParseError::BadHandle:
             return "BadHandle";
+        case ParseError::BadTimeInForce:
+            return "BadTimeInForce";
+        case ParseError::BadParticipant:
+            return "BadParticipant";
         case ParseError::WrongFieldCount:
             return "WrongFieldCount";
     }

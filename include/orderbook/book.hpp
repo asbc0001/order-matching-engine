@@ -157,8 +157,8 @@ class Book {
 
     // Structural rest operation only: higher-level matching code will wrap this
     // with event/reject semantics. A null result means the order did not rest.
-    [[nodiscard]] std::optional<Handle> insert(Side side, Price price, Qty qty,
-                                               uint64_t client_seq) noexcept {
+    [[nodiscard]] std::optional<Handle> insert(Side side, Price price, Qty qty, uint64_t client_seq,
+                                               ParticipantId participant_id = 0) noexcept {
         const auto idx = price_to_index(price);
         if (!idx || qty == 0 || would_cross(side, *idx)) {
             return std::nullopt;
@@ -180,6 +180,7 @@ class Book {
         order.client_seq = client_seq;
         order.price = price;
         order.remaining = qty;
+        order.participant_id = participant_id;
         order.side = side;
 
         const bool was_empty = target.order_count == 0;

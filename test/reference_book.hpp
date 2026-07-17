@@ -57,6 +57,7 @@ class ReferenceBook {
         Handle handle;
         Price price;
         Qty remaining;
+        ParticipantId participant_id;
         Side side;
     };
 
@@ -97,6 +98,10 @@ class ReferenceBook {
 
     static bool price_in_band(Price price) noexcept {
         return price >= BasePrice && price < limit_price();
+    }
+
+    static bool is_self_trade(ParticipantId incoming_id, ParticipantId resting_id) noexcept {
+        return incoming_id != 0 && resting_id != 0 && incoming_id == resting_id;
     }
 
     static OutboundEvent base_event(const InboundMsg& msg) noexcept {
@@ -180,7 +185,26 @@ class ReferenceBook {
         }
 
         Qty remaining = msg.qty;
+
+        if (msg.time_in_force == TimeInForce::FOK) {
+            switch (check_fill_or_kill(msg, msg.price)) {
+                case FillOrKillCheck::CanFill:
+                    break;
+                case FillOrKillCheck::NotEnoughQuantity:
+                    events.finish(make_reject(msg, RejectReason::FillOrKillNotFilled, msg.qty));
+                    return;
+                case FillOrKillCheck::SelfTrade:
+                    events.finish(make_reject(msg, RejectReason::SelfTrade, msg.qty));
+                    return;
+            }
+        }
+
         if (cross(msg, msg.price, remaining, events)) {
+            return;
+        }
+
+        if (msg.time_in_force == TimeInForce::IOC) {
+            events.finish(make_reject(msg, RejectReason::ImmediateOrCancelRemainder, remaining));
             return;
         }
 
@@ -195,6 +219,7 @@ class ReferenceBook {
             .handle = handle,
             .price = msg.price,
             .remaining = remaining,
+            .participant_id = msg.participant_id,
             .side = msg.side,
         };
         rest(order);
@@ -235,6 +260,10 @@ class ReferenceBook {
             if (resting == nullptr) {
                 return false;
             }
+            if (is_self_trade(msg.participant_id, resting->participant_id)) {
+                events.finish(make_reject(msg, RejectReason::SelfTrade, remaining));
+                return true;
+            }
 
             const Qty fill_qty = std::min(remaining, resting->remaining);
             OutboundEvent resting_fill = make_resting_fill(msg, *resting, fill_qty);
@@ -252,6 +281,56 @@ class ReferenceBook {
         }
 
         return false;
+    }
+
+    enum class FillOrKillCheck {
+        CanFill,
+        NotEnoughQuantity,
+        SelfTrade,
+    };
+
+    FillOrKillCheck check_fill_or_kill(const InboundMsg& msg, Price limit_price) const {
+        AggQty available = 0;
+
+        if (msg.side == Side::Bid) {
+            for (const auto& [price, orders] : asks_) {
+                if (price > limit_price) {
+                    break;
+                }
+                const FillOrKillCheck result = add_fillable_orders(msg, orders, available);
+                if (result != FillOrKillCheck::NotEnoughQuantity) {
+                    return result;
+                }
+            }
+            return FillOrKillCheck::NotEnoughQuantity;
+        }
+
+        for (const auto& [price, orders] : bids_) {
+            if (price < limit_price) {
+                break;
+            }
+            const FillOrKillCheck result = add_fillable_orders(msg, orders, available);
+            if (result != FillOrKillCheck::NotEnoughQuantity) {
+                return result;
+            }
+        }
+        return FillOrKillCheck::NotEnoughQuantity;
+    }
+
+    FillOrKillCheck add_fillable_orders(const InboundMsg& msg, const std::deque<RefOrder>& orders,
+                                        AggQty& available) const {
+        // Preserve FIFO priority in the pre-check: if the head order belongs to
+        // the same participant, later orders at that price are not reachable.
+        for (const RefOrder& order : orders) {
+            if (is_self_trade(msg.participant_id, order.participant_id)) {
+                return FillOrKillCheck::SelfTrade;
+            }
+            available += order.remaining;
+            if (available >= msg.qty) {
+                return FillOrKillCheck::CanFill;
+            }
+        }
+        return FillOrKillCheck::NotEnoughQuantity;
     }
 
     RefOrder* best_opposite(Side aggressor_side, std::optional<Price> limit_price) {

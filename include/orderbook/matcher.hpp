@@ -99,6 +99,12 @@ class Matcher {
         return price >= BasePrice && price < limit_price();
     }
 
+    // Participant 0 means "not assigned". Existing tests and simple tools use
+    // that default, so they do not accidentally block every match as self-trade.
+    static bool is_self_trade(ParticipantId incoming_id, ParticipantId resting_id) noexcept {
+        return incoming_id != 0 && resting_id != 0 && incoming_id == resting_id;
+    }
+
     // Start every event from the inbound request identity. Specific builders
     // fill in the fields meaningful for each event type. tsc_egress is left at
     // zero until timing support is added.
@@ -194,11 +200,31 @@ class Matcher {
         Qty remaining = msg.qty;
         const auto limit_idx = BookType::price_to_index(msg.price);
         assert(limit_idx.has_value());
+
+        if (msg.time_in_force == TimeInForce::FOK) {
+            switch (check_fill_or_kill(msg, *limit_idx)) {
+                case FillOrKillCheck::CanFill:
+                    break;
+                case FillOrKillCheck::NotEnoughQuantity:
+                    events.finish(make_reject(msg, RejectReason::FillOrKillNotFilled, msg.qty));
+                    return;
+                case FillOrKillCheck::SelfTrade:
+                    events.finish(make_reject(msg, RejectReason::SelfTrade, msg.qty));
+                    return;
+            }
+        }
+
         if (cross(msg, limit_idx, remaining, events)) {
             return;
         }
 
-        const auto handle = book_.insert(msg.side, msg.price, remaining, msg.client_seq);
+        if (msg.time_in_force == TimeInForce::IOC) {
+            events.finish(make_reject(msg, RejectReason::ImmediateOrCancelRemainder, remaining));
+            return;
+        }
+
+        const auto handle =
+            book_.insert(msg.side, msg.price, remaining, msg.client_seq, msg.participant_id);
         if (!handle) {
             assert(book_.pool().free_head_for_audit() == NULL_SLOT);
             events.finish(make_reject(msg, RejectReason::PoolExhausted, remaining));
@@ -262,6 +288,11 @@ class Matcher {
             const Level& level = book_.level(*best);
             assert(level.head != NULL_SLOT);
             const Order& resting = book_.pool().at(level.head);
+            if (is_self_trade(msg.participant_id, resting.participant_id)) {
+                events.finish(make_reject(msg, RejectReason::SelfTrade, remaining));
+                return true;
+            }
+
             const Qty fill_qty = std::min(remaining, resting.remaining);
 
             OutboundEvent resting_fill = make_resting_fill(msg, resting, fill_qty);
@@ -283,6 +314,68 @@ class Matcher {
         }
 
         return false;
+    }
+
+    enum class FillOrKillCheck {
+        CanFill,
+        NotEnoughQuantity,
+        SelfTrade,
+    };
+
+    FillOrKillCheck check_fill_or_kill(const InboundMsg& msg,
+                                       std::size_t limit_idx) const noexcept {
+        AggQty available = 0;
+
+        if (msg.side == Side::Bid) {
+            for (std::size_t idx = 0; idx <= limit_idx; ++idx) {
+                const FillOrKillCheck result = add_fillable_level(msg, idx, available);
+                if (result != FillOrKillCheck::NotEnoughQuantity) {
+                    return result;
+                }
+            }
+            return FillOrKillCheck::NotEnoughQuantity;
+        }
+
+        for (std::size_t idx = NumLevels; idx-- > limit_idx;) {
+            const FillOrKillCheck result = add_fillable_level(msg, idx, available);
+            if (result != FillOrKillCheck::NotEnoughQuantity) {
+                return result;
+            }
+        }
+        return FillOrKillCheck::NotEnoughQuantity;
+    }
+
+    FillOrKillCheck add_fillable_level(const InboundMsg& msg, std::size_t idx,
+                                       AggQty& available) const noexcept {
+        if (!book_.occupied(idx)) {
+            return FillOrKillCheck::NotEnoughQuantity;
+        }
+
+        const Level& level = book_.level(idx);
+        if (level.head == NULL_SLOT) {
+            return FillOrKillCheck::NotEnoughQuantity;
+        }
+        const Side opposite = msg.side == Side::Bid ? Side::Ask : Side::Bid;
+        if (book_.pool().at(level.head).side != opposite) {
+            return FillOrKillCheck::NotEnoughQuantity;
+        }
+
+        // Walk FIFO order. A same-participant order blocks the incoming order;
+        // the matcher must not skip it to reach later orders at the same price.
+        uint32_t slot = level.head;
+        while (slot != NULL_SLOT) {
+            const Order& order = book_.pool().at(slot);
+            if (is_self_trade(msg.participant_id, order.participant_id)) {
+                return FillOrKillCheck::SelfTrade;
+            }
+            available += order.remaining;
+            if (available >= msg.qty) {
+                return FillOrKillCheck::CanFill;
+            }
+            slot = order.next;
+        }
+
+        return FillOrKillCheck::NotEnoughQuantity;
     }
 
     // Return whether an incoming limit order can trade at opposite_idx. Indices

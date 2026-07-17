@@ -25,8 +25,23 @@ bool expect_error(ob::trace::ParseError actual, ob::trace::ParseError expected,
 bool check_valid_lines() {
     const auto limit = ob::trace::parse_line(10, "LIMIT BID 123 45");
     if (!limit || limit.value.client_seq != 10 || limit.value.type != ob::MsgType::NewLimit ||
-        limit.value.side != ob::Side::Bid || limit.value.price != 123 || limit.value.qty != 45) {
+        limit.value.side != ob::Side::Bid || limit.value.price != 123 || limit.value.qty != 45 ||
+        limit.value.time_in_force != ob::TimeInForce::GTC || limit.value.participant_id != 0) {
         return fail("LIMIT parse failed");
+    }
+
+    const auto ioc = ob::trace::parse_line(13, "LIMIT ASK 124 46 IOC PARTICIPANT=7");
+    if (!ioc || ioc.value.type != ob::MsgType::NewLimit || ioc.value.side != ob::Side::Ask ||
+        ioc.value.price != 124 || ioc.value.qty != 46 ||
+        ioc.value.time_in_force != ob::TimeInForce::IOC || ioc.value.participant_id != 7) {
+        return fail("LIMIT IOC participant parse failed");
+    }
+
+    const auto fok = ob::trace::parse_line(14, "LIMIT BID 125 47 PARTICIPANT=8 FOK");
+    if (!fok || fok.value.type != ob::MsgType::NewLimit || fok.value.side != ob::Side::Bid ||
+        fok.value.price != 125 || fok.value.qty != 47 ||
+        fok.value.time_in_force != ob::TimeInForce::FOK || fok.value.participant_id != 8) {
+        return fail("LIMIT FOK participant parse failed");
     }
 
     const auto market = ob::trace::parse_line(11, "\tMARKET ASK 7  ");
@@ -50,7 +65,19 @@ bool check_malformed_line() {
     }
 
     const auto bad_qty = ob::trace::parse_line(2, "MARKET ASK lots");
-    return expect_error(bad_qty.error, ob::trace::ParseError::BadQty, "Bad quantity check failed");
+    if (!expect_error(bad_qty.error, ob::trace::ParseError::BadQty, "Bad quantity check failed")) {
+        return false;
+    }
+
+    const auto bad_tif = ob::trace::parse_line(3, "LIMIT BID 100 5 DAY");
+    if (!expect_error(bad_tif.error, ob::trace::ParseError::BadTimeInForce,
+                      "Bad time-in-force check failed")) {
+        return false;
+    }
+
+    const auto bad_participant = ob::trace::parse_line(4, "LIMIT BID 100 5 PARTICIPANT=abc");
+    return expect_error(bad_participant.error, ob::trace::ParseError::BadParticipant,
+                        "Bad participant check failed");
 }
 
 bool check_unknown_command() {

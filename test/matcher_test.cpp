@@ -44,8 +44,13 @@ ob::InboundMsg msg(uint64_t seq, ob::MsgType type, ob::Side side, ob::Price pric
     };
 }
 
-ob::InboundMsg limit_msg(uint64_t seq, ob::Side side, ob::Price price, ob::Qty qty) noexcept {
-    return msg(seq, ob::MsgType::NewLimit, side, price, qty);
+ob::InboundMsg limit_msg(uint64_t seq, ob::Side side, ob::Price price, ob::Qty qty,
+                         ob::TimeInForce time_in_force = ob::TimeInForce::GTC,
+                         ob::ParticipantId participant_id = 0) noexcept {
+    ob::InboundMsg command = msg(seq, ob::MsgType::NewLimit, side, price, qty);
+    command.time_in_force = time_in_force;
+    command.participant_id = participant_id;
+    return command;
 }
 
 ob::InboundMsg market_msg(uint64_t seq, ob::Side side, ob::Qty qty) noexcept {
@@ -118,9 +123,9 @@ bool expect_fill(const ob::OutboundEvent& event, uint64_t seq, ob::Handle handle
 
 template <typename Matcher>
 std::optional<ob::Handle> rest_limit(Matcher& matcher, uint64_t seq, ob::Side side, ob::Price price,
-                                     ob::Qty qty) {
+                                     ob::Qty qty, ob::ParticipantId participant_id = 0) {
     RecordingSink sink;
-    matcher.process(limit_msg(seq, side, price, qty), sink);
+    matcher.process(limit_msg(seq, side, price, qty, ob::TimeInForce::GTC, participant_id), sink);
     if (!expect_count(sink, 1, "rest setup did not emit one complete event") ||
         !expect_ack_new(sink.events[0], seq, price, qty, side)) {
         return std::nullopt;
@@ -161,7 +166,7 @@ bool check_limit_rests_and_acknowledges_handle() {
 
     const ob::Order* order = matcher.book().pool().resolve(*handle);
     if (order == nullptr || order->client_seq != 10 || order->price != 42 ||
-        order->remaining != 75 || order->side != ob::Side::Bid) {
+        order->remaining != 75 || order->participant_id != 0 || order->side != ob::Side::Bid) {
         return fail("resting order fields failed");
     }
     return matcher.book().occupied(42) && matcher.book().level(42).order_count == 1 &&
@@ -318,6 +323,93 @@ bool check_full_pool_cross_can_rest_after_freeing_slot() {
            expect_ack_new(sink.events[2], 121, 100, 15, ob::Side::Bid) && matcher.book().audit();
 }
 
+// IOC means "trade what is available now, but do not rest the leftover".
+bool check_ioc_partial_fill_rejects_remainder() {
+    TestMatcher matcher;
+    const auto ask = rest_limit(matcher, 130, ob::Side::Ask, 100, 10);
+    if (!ask) {
+        return false;
+    }
+
+    RecordingSink sink;
+    matcher.process(limit_msg(131, ob::Side::Bid, 100, 25, ob::TimeInForce::IOC), sink);
+    return expect_count(sink, 3, "IOC partial-fill event count failed") &&
+           expect_fill(sink.events[0], 130, *ask, 100, 10, ob::Side::Ask, false) &&
+           expect_fill(sink.events[1], 131, 0, 100, 10, ob::Side::Bid, false) &&
+           expect_reject(sink.events[2], 131, ob::RejectReason::ImmediateOrCancelRemainder, 15) &&
+           !matcher.book().best_ask_idx() && !matcher.book().best_bid_idx() &&
+           matcher.book().audit();
+}
+
+// FOK means "fill the whole order immediately, or leave the book untouched".
+bool check_fok_insufficient_liquidity_fills_nothing() {
+    TestMatcher matcher;
+    const auto ask = rest_limit(matcher, 140, ob::Side::Ask, 100, 10);
+    if (!ask) {
+        return false;
+    }
+
+    RecordingSink sink;
+    matcher.process(limit_msg(141, ob::Side::Bid, 100, 25, ob::TimeInForce::FOK), sink);
+    const ob::Order* resting = matcher.book().pool().resolve(*ask);
+    return expect_count(sink, 1, "FOK insufficient event count failed") &&
+           expect_reject(sink.events[0], 141, ob::RejectReason::FillOrKillNotFilled, 25) &&
+           resting != nullptr && resting->remaining == 10 && matcher.book().audit();
+}
+
+// When enough quantity is immediately available, FOK uses the normal fill path.
+bool check_fok_exact_liquidity_fills_fully() {
+    TestMatcher matcher;
+    const auto ask100 = rest_limit(matcher, 150, ob::Side::Ask, 100, 10);
+    const auto ask101 = rest_limit(matcher, 151, ob::Side::Ask, 101, 15);
+    if (!ask100 || !ask101) {
+        return false;
+    }
+
+    RecordingSink sink;
+    matcher.process(limit_msg(152, ob::Side::Bid, 101, 25, ob::TimeInForce::FOK), sink);
+    return expect_count(sink, 4, "FOK full-fill event count failed") &&
+           expect_fill(sink.events[0], 150, *ask100, 100, 10, ob::Side::Ask, false) &&
+           expect_fill(sink.events[1], 152, 0, 100, 10, ob::Side::Bid, false) &&
+           expect_fill(sink.events[2], 151, *ask101, 101, 15, ob::Side::Ask, false) &&
+           expect_fill(sink.events[3], 152, 0, 101, 15, ob::Side::Bid, true) &&
+           !matcher.book().best_ask_idx() && !matcher.book().best_bid_idx() &&
+           matcher.book().audit();
+}
+
+// Same non-zero participant on both sides rejects the newer incoming order.
+bool check_self_trade_rejects_incoming_order() {
+    TestMatcher matcher;
+    const auto ask = rest_limit(matcher, 160, ob::Side::Ask, 100, 10, 7);
+    if (!ask) {
+        return false;
+    }
+
+    RecordingSink sink;
+    matcher.process(limit_msg(161, ob::Side::Bid, 100, 5, ob::TimeInForce::GTC, 7), sink);
+    const ob::Order* resting = matcher.book().pool().resolve(*ask);
+    return expect_count(sink, 1, "self-trade reject event count failed") &&
+           expect_reject(sink.events[0], 161, ob::RejectReason::SelfTrade, 5) &&
+           resting != nullptr && resting->remaining == 10 && matcher.book().audit();
+}
+
+// Different non-zero participants should trade normally.
+bool check_different_participants_can_cross() {
+    TestMatcher matcher;
+    const auto ask = rest_limit(matcher, 170, ob::Side::Ask, 100, 10, 7);
+    if (!ask) {
+        return false;
+    }
+
+    RecordingSink sink;
+    matcher.process(limit_msg(171, ob::Side::Bid, 100, 5, ob::TimeInForce::GTC, 8), sink);
+    const ob::Order* resting = matcher.book().pool().resolve(*ask);
+    return expect_count(sink, 2, "different-participant fill event count failed") &&
+           expect_fill(sink.events[0], 170, *ask, 100, 5, ob::Side::Ask, false) &&
+           expect_fill(sink.events[1], 171, 0, 100, 5, ob::Side::Bid, true) && resting != nullptr &&
+           resting->remaining == 5 && matcher.book().audit();
+}
+
 // A valid cancel should remove the resting order and report its removed fields.
 bool check_cancel_acknowledges_and_removes() {
     TestMatcher matcher;
@@ -387,7 +479,7 @@ bool check_request_complete_across_representative_paths() {
 
 int main() {
     using Check = bool (*)();
-    constexpr std::array<Check, 15> checks{
+    constexpr std::array<Check, 20> checks{
         check_limit_validation_rejects,
         check_limit_rests_and_acknowledges_handle,
         check_market_empty_rejects,
@@ -399,6 +491,11 @@ int main() {
         check_market_partial_fill_then_reject,
         check_pool_exhausted_rejects_resting_remainder,
         check_full_pool_cross_can_rest_after_freeing_slot,
+        check_ioc_partial_fill_rejects_remainder,
+        check_fok_insufficient_liquidity_fills_nothing,
+        check_fok_exact_liquidity_fills_fully,
+        check_self_trade_rejects_incoming_order,
+        check_different_participants_can_cross,
         check_cancel_acknowledges_and_removes,
         check_unknown_cancel_rejects,
         check_stop_engine_emits_internal_event,
