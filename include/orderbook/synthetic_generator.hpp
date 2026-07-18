@@ -23,6 +23,14 @@ struct GeneratorConfig {
     std::uint8_t limit_weight{70};
     std::uint8_t market_weight{20};
     std::uint8_t cancel_weight{10};
+    // Time-in-force weights apply only to generated limit orders. Defaults keep
+    // old generated streams as normal resting limit orders unless opted in.
+    std::uint8_t gtc_weight{1};
+    std::uint8_t ioc_weight{0};
+    std::uint8_t fok_weight{0};
+    // 0 keeps all commands unassigned. A nonzero value chooses participant IDs
+    // from 1..participant_count so self-trade paths can be exercised on demand.
+    std::uint8_t participant_count{0};
     // When true, CANCEL commands are only made from handles learned through
     // observe(). This is used for saved command files that should replay
     // without UnknownHandle rejects.
@@ -49,10 +57,11 @@ class CommandGenerator {
                 return safe_resting_limit(client_seq);
             }
             return make_msg(client_seq, MsgType::NewLimit, random_side(), random_price(),
-                            random_qty());
+                            random_qty(), 0, random_time_in_force(), random_participant());
         }
         if (pick < static_cast<std::uint64_t>(config_.limit_weight) + config_.market_weight) {
-            return make_msg(client_seq, MsgType::NewMarket, random_side(), 0, random_qty());
+            return make_msg(client_seq, MsgType::NewMarket, random_side(), 0, random_qty(), 0,
+                            TimeInForce::GTC, random_participant());
         }
         if (config_.valid_cancels_only && live_count_ == 0) {
             return safe_resting_limit(client_seq);
@@ -91,7 +100,9 @@ class CommandGenerator {
     };
 
     static InboundMsg make_msg(std::uint64_t client_seq, MsgType type, Side side, Price price,
-                               Qty qty, Handle handle = 0) noexcept {
+                               Qty qty, Handle handle = 0,
+                               TimeInForce time_in_force = TimeInForce::GTC,
+                               ParticipantId participant_id = 0) noexcept {
         return InboundMsg{
             .client_seq = client_seq,
             .handle = handle,
@@ -99,6 +110,8 @@ class CommandGenerator {
             .qty = qty,
             .side = side,
             .type = type,
+            .time_in_force = time_in_force,
+            .participant_id = participant_id,
             .tsc_intended = 0,
             .tsc_ready = 0,
             .tsc_enqueue = 0,
@@ -108,6 +121,33 @@ class CommandGenerator {
     // Choose Bid/Ask evenly so generated traffic exercises both books sides.
     Side random_side() noexcept {
         return (rng_() & 1u) == 0 ? Side::Bid : Side::Ask;
+    }
+
+    // Choose how a limit order should behave if it cannot fully trade now.
+    TimeInForce random_time_in_force() noexcept {
+        const std::uint64_t total_weight = static_cast<std::uint64_t>(config_.gtc_weight) +
+                                           config_.ioc_weight + config_.fok_weight;
+        if (total_weight == 0) {
+            return TimeInForce::GTC;
+        }
+
+        const std::uint64_t pick = rng_() % total_weight;
+        if (pick < config_.gtc_weight) {
+            return TimeInForce::GTC;
+        }
+        if (pick < static_cast<std::uint64_t>(config_.gtc_weight) + config_.ioc_weight) {
+            return TimeInForce::IOC;
+        }
+        return TimeInForce::FOK;
+    }
+
+    // Participant IDs are optional. Returning 0 means self-trade prevention is
+    // intentionally disabled for that generated command.
+    ParticipantId random_participant() noexcept {
+        if (config_.participant_count == 0) {
+            return 0;
+        }
+        return static_cast<ParticipantId>((rng_() % config_.participant_count) + 1);
     }
 
     // Mix ordinary sizes with zero and very large quantities. The matcher, not
@@ -157,7 +197,8 @@ class CommandGenerator {
         const std::size_t price_index = side == Side::Bid ? bid_index : ask_index;
         const Qty qty = static_cast<Qty>((rng_() % 200) + 1);
         return make_msg(client_seq, MsgType::NewLimit, side,
-                        BasePrice + static_cast<Price>(price_index), qty);
+                        BasePrice + static_cast<Price>(price_index), qty, 0, TimeInForce::GTC,
+                        random_participant());
     }
 
     // Prefer real live handles when observe() has seen them. Otherwise generate

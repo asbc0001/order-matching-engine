@@ -50,6 +50,12 @@ The generator runs commands through the matcher while writing the file. That
 lets later generated cancels use real handles assigned by earlier accepted
 orders.
 
+Mixed mode adds IOC/FOK limit orders and participant IDs:
+
+```bash
+build/debug/tools/generate_saved_commands output.commands 1000 123 --mixed
+```
+
 ## run_engine
 
 Replays a saved command file through the threaded engine:

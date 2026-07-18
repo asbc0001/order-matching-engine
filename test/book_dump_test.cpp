@@ -33,9 +33,9 @@ bool read_dump(TestBook& book, char* buffer, std::size_t capacity) {
 
 bool check_dump_includes_best_levels_and_fifo_orders() {
     TestBook book;
-    const auto first_bid = book.insert(ob::Side::Bid, 10, 30, 101);
+    const auto first_bid = book.insert(ob::Side::Bid, 10, 30, 101, 7);
     const auto second_bid = book.insert(ob::Side::Bid, 10, 40, 102);
-    const auto ask = book.insert(ob::Side::Ask, 20, 50, 201);
+    const auto ask = book.insert(ob::Side::Ask, 20, 50, 201, 9);
     if (!first_bid || !second_bid || !ask) {
         return fail("Book setup failed");
     }
@@ -44,10 +44,10 @@ bool check_dump_includes_best_levels_and_fifo_orders() {
     constexpr char expected[] =
         "BEST bid=10 ask=20\n"
         "LEVEL price=10 count=2 qty=70\n"
-        "  ORDER handle=4294967296 client_seq=101 remaining=30 side=Bid\n"
-        "  ORDER handle=4294967297 client_seq=102 remaining=40 side=Bid\n"
+        "  ORDER handle=4294967296 client_seq=101 remaining=30 participant=7 side=Bid\n"
+        "  ORDER handle=4294967297 client_seq=102 remaining=40 participant=0 side=Bid\n"
         "LEVEL price=20 count=1 qty=50\n"
-        "  ORDER handle=4294967298 client_seq=201 remaining=50 side=Ask\n";
+        "  ORDER handle=4294967298 client_seq=201 remaining=50 participant=9 side=Ask\n";
 
     return read_dump(book, buffer, sizeof(buffer)) && std::strcmp(buffer, expected) == 0
                ? true

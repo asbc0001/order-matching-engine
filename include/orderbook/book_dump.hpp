@@ -58,10 +58,12 @@ bool dump_book(const Book<NumLevels, PoolCapacity, BasePrice>& book, std::FILE* 
         std::uint32_t slot = level.head;
         while (slot != NULL_SLOT) {
             const Order& order = book.pool().at(slot);
-            if (std::fprintf(file, "  ORDER handle=%llu client_seq=%llu remaining=%u side=%s\n",
+            if (std::fprintf(file,
+                             "  ORDER handle=%llu client_seq=%llu remaining=%u participant=%u "
+                             "side=%s\n",
                              static_cast<unsigned long long>(order.handle),
                              static_cast<unsigned long long>(order.client_seq),
-                             static_cast<unsigned>(order.remaining),
+                             static_cast<unsigned>(order.remaining), order.participant_id,
                              book_dump_side_name(order.side)) < 0) {
                 return false;
             }

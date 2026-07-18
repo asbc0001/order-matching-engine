@@ -52,7 +52,9 @@ bool write_bytes(std::FILE* file, const std::uint8_t* bytes, std::size_t size, c
 // Keep the interface minimal: output path, number of commands, seed, and an
 // optional workload mode fully define a repeatable generated command file.
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s <output.commands> <command_count> <seed> [--cancel-heavy]\n",
+    std::fprintf(stderr,
+                 "usage: %s <output.commands> <command_count> <seed> "
+                 "[--cancel-heavy|--mixed]\n",
                  program);
     return 2;
 }
@@ -72,17 +74,31 @@ int main(int argc, char** argv) {
 
     ob::synthetic::GeneratorConfig config;
     if (argc == 5) {
-        if (std::string_view{argv[4]} != "--cancel-heavy") {
+        const std::string_view mode{argv[4]};
+        if (mode == "--cancel-heavy") {
+            // Bias toward cancels while still generating enough new limits for
+            // the generator to learn real live handles from matcher output.
+            config = ob::synthetic::GeneratorConfig{
+                .limit_weight = 50,
+                .market_weight = 0,
+                .cancel_weight = 50,
+                .valid_cancels_only = true,
+            };
+        } else if (mode == "--mixed") {
+            // A broader generated file for replay and benchmark preparation:
+            // limits, markets, cancels, IOC/FOK, and a small participant pool.
+            config = ob::synthetic::GeneratorConfig{
+                .limit_weight = 70,
+                .market_weight = 20,
+                .cancel_weight = 10,
+                .gtc_weight = 8,
+                .ioc_weight = 1,
+                .fok_weight = 1,
+                .participant_count = 3,
+            };
+        } else {
             return usage(argv[0]);
         }
-        // Bias toward cancels while still generating enough new limits for the
-        // generator to learn real live handles from matcher output.
-        config = ob::synthetic::GeneratorConfig{
-            .limit_weight = 50,
-            .market_weight = 0,
-            .cancel_weight = 50,
-            .valid_cancels_only = true,
-        };
     }
 
     std::FILE* output = std::fopen(argv[1], "wb");

@@ -17,9 +17,12 @@ bool fail(const char* message) {
 
 bool same_command(const ob::InboundMsg& lhs, const ob::InboundMsg& rhs) {
     return lhs.client_seq == rhs.client_seq && lhs.handle == rhs.handle && lhs.price == rhs.price &&
-           lhs.qty == rhs.qty && lhs.side == rhs.side && lhs.type == rhs.type;
+           lhs.qty == rhs.qty && lhs.side == rhs.side && lhs.type == rhs.type &&
+           lhs.time_in_force == rhs.time_in_force && lhs.participant_id == rhs.participant_id;
 }
 
+// A fixed seed must produce the same commands every run. That makes failures
+// reproducible when this generator is used by tests or benchmark tools.
 bool check_same_seed_repeats_stream() {
     Generator first{12345};
     Generator second{12345};
@@ -32,6 +35,64 @@ bool check_same_seed_repeats_stream() {
     return true;
 }
 
+// The default config should preserve old behavior: generated limit orders are
+// normal GTC orders and do not have a participant assigned.
+bool check_default_limits_are_gtc_and_unassigned() {
+    ob::synthetic::GeneratorConfig only_limits{
+        .limit_weight = 1,
+        .market_weight = 0,
+        .cancel_weight = 0,
+    };
+    Generator generator{1, only_limits};
+
+    const ob::InboundMsg command = generator.next(1);
+    return command.type == ob::MsgType::NewLimit && command.time_in_force == ob::TimeInForce::GTC &&
+                   command.participant_id == 0
+               ? true
+               : fail("Default limit fields changed");
+}
+
+// Forced weights give a deterministic way to prove IOC generation and non-zero
+// participant assignment without relying on statistical chance.
+bool check_forced_ioc_and_participants() {
+    ob::synthetic::GeneratorConfig config{
+        .limit_weight = 1,
+        .market_weight = 0,
+        .cancel_weight = 0,
+        .gtc_weight = 0,
+        .ioc_weight = 1,
+        .fok_weight = 0,
+        .participant_count = 3,
+    };
+    Generator generator{2, config};
+
+    const ob::InboundMsg command = generator.next(1);
+    return command.type == ob::MsgType::NewLimit && command.time_in_force == ob::TimeInForce::IOC &&
+                   command.participant_id >= 1 && command.participant_id <= 3
+               ? true
+               : fail("Forced IOC/participant generation failed");
+}
+
+// Same idea as the IOC check, but for fill-or-kill limit orders.
+bool check_forced_fok() {
+    ob::synthetic::GeneratorConfig config{
+        .limit_weight = 1,
+        .market_weight = 0,
+        .cancel_weight = 0,
+        .gtc_weight = 0,
+        .ioc_weight = 0,
+        .fok_weight = 1,
+    };
+    Generator generator{3, config};
+
+    const ob::InboundMsg command = generator.next(1);
+    return command.type == ob::MsgType::NewLimit && command.time_in_force == ob::TimeInForce::FOK
+               ? true
+               : fail("Forced FOK generation failed");
+}
+
+// observe() lets the generator learn handles assigned by the matcher, so later
+// generated CANCEL commands can target real live orders.
 bool check_observed_ack_new_enables_valid_cancel() {
     ob::synthetic::GeneratorConfig only_cancel{
         .limit_weight = 0,
@@ -60,6 +121,8 @@ bool check_observed_ack_new_enables_valid_cancel() {
                : fail("Valid cancel failed");
 }
 
+// In valid-cancel-only mode, the generator must create a resting setup order
+// before it can create the first cancel.
 bool check_valid_cancel_mode_creates_real_cancel_path() {
     ob::synthetic::GeneratorConfig valid_cancel_only{
         .limit_weight = 0,
@@ -69,8 +132,7 @@ bool check_valid_cancel_mode_creates_real_cancel_path() {
     };
     Generator generator{7, valid_cancel_only};
 
-    // With no known handles yet, the generator must create a real resting
-    // limit order first. A forged cancel would fail the replay gate.
+    // With no known handles yet, a forged cancel would fail the replay check.
     const ob::InboundMsg setup = generator.next(1);
     if (setup.type != ob::MsgType::NewLimit || setup.qty == 0) {
         return fail("Valid-cancel mode did not create a setup limit");
@@ -96,6 +158,8 @@ bool check_valid_cancel_mode_creates_real_cancel_path() {
                : fail("Valid-cancel mode did not use the observed handle");
 }
 
+// Once a learned order is fully filled, it should disappear from the generator's
+// live-handle list so future valid cancels do not target a dead handle.
 bool check_fill_removes_exhausted_handle() {
     Generator generator{9};
     constexpr ob::Handle kHandle = 0x200000001ULL;
@@ -132,8 +196,11 @@ bool check_fill_removes_exhausted_handle() {
 
 int main() {
     using Check = bool (*)();
-    constexpr std::array<Check, 4> checks{
+    constexpr std::array<Check, 7> checks{
         check_same_seed_repeats_stream,
+        check_default_limits_are_gtc_and_unassigned,
+        check_forced_ioc_and_participants,
+        check_forced_fok,
         check_observed_ack_new_enables_valid_cancel,
         check_valid_cancel_mode_creates_real_cancel_path,
         check_fill_removes_exhausted_handle,

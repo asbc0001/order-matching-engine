@@ -161,11 +161,16 @@ ob::InboundMsg stop_command(std::uint64_t client_seq) noexcept {
 void run_producer(InboundRing& inbound, const Options& options, std::uint64_t start_time,
                   ProducerStats& stats) {
     // Live threaded generation cannot safely learn real handles from the logger,
-    // so this first benchmark disables cancels and uses limits/markets only.
+    // so this benchmark still disables cancels. IOC/FOK and participants are
+    // included so the matching path is closer to the finished command mix.
     ob::synthetic::GeneratorConfig config{
         .limit_weight = 80,
         .market_weight = 20,
         .cancel_weight = 0,
+        .gtc_weight = 8,
+        .ioc_weight = 1,
+        .fok_weight = 1,
+        .participant_count = 3,
     };
     Generator generator{options.seed, config};
 
