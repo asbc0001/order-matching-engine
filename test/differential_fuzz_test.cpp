@@ -55,6 +55,11 @@ struct Coverage {
     std::size_t price_out_of_band{0};
     std::size_t unknown_handle{0};
     std::size_t zero_qty{0};
+    // These prove the newer limit-order paths were actually exercised, not
+    // merely compiled into the matcher.
+    std::size_t ioc_remainder{0};
+    std::size_t fok_not_filled{0};
+    std::size_t self_trade{0};
 };
 
 // The fuzzer tracks only what a client could learn from events, not internals.
@@ -70,7 +75,8 @@ struct CommandPair {
 };
 
 ob::InboundMsg msg(uint64_t seq, ob::MsgType type, ob::Side side, ob::Price price, ob::Qty qty,
-                   ob::Handle handle = 0) noexcept {
+                   ob::Handle handle = 0, ob::TimeInForce time_in_force = ob::TimeInForce::GTC,
+                   ob::ParticipantId participant_id = 0) noexcept {
     return ob::InboundMsg{
         .client_seq = seq,
         .handle = handle,
@@ -78,6 +84,8 @@ ob::InboundMsg msg(uint64_t seq, ob::MsgType type, ob::Side side, ob::Price pric
         .qty = qty,
         .side = side,
         .type = type,
+        .time_in_force = time_in_force,
+        .participant_id = participant_id,
         .tsc_intended = 0,
         .tsc_ready = 0,
         .tsc_enqueue = 0,
@@ -102,6 +110,18 @@ const char* type_name(ob::MsgType type) {
     return "?";
 }
 
+const char* time_in_force_name(ob::TimeInForce time_in_force) {
+    switch (time_in_force) {
+        case ob::TimeInForce::GTC:
+            return "GTC";
+        case ob::TimeInForce::IOC:
+            return "IOC";
+        case ob::TimeInForce::FOK:
+            return "FOK";
+    }
+    return "?";
+}
+
 const char* event_name(ob::EventType type) {
     switch (type) {
         case ob::EventType::AckNew:
@@ -121,9 +141,10 @@ const char* event_name(ob::EventType type) {
 void print_command(const char* label, const ob::InboundMsg& command) {
     std::fprintf(stderr,
                  "%s{seq=%" PRIu64 ", type=%s, side=%s, price=%" PRId64 ", qty=%" PRIu32
-                 ", handle=%" PRIu64 "}\n",
+                 ", handle=%" PRIu64 ", tif=%s, participant=%" PRIu32 "}\n",
                  label, command.client_seq, type_name(command.type), side_name(command.side),
-                 command.price, command.qty, command.handle);
+                 command.price, command.qty, command.handle,
+                 time_in_force_name(command.time_in_force), command.participant_id);
 }
 
 void print_event(const char* label, const ob::OutboundEvent& event) {
@@ -184,6 +205,15 @@ void record_coverage(const std::vector<ob::OutboundEvent>& events, Coverage& cov
             case ob::RejectReason::ZeroQty:
                 ++coverage.zero_qty;
                 break;
+            case ob::RejectReason::ImmediateOrCancelRemainder:
+                ++coverage.ioc_remainder;
+                break;
+            case ob::RejectReason::FillOrKillNotFilled:
+                ++coverage.fok_not_filled;
+                break;
+            case ob::RejectReason::SelfTrade:
+                ++coverage.self_trade;
+                break;
             default:
                 break;
         }
@@ -192,12 +222,14 @@ void record_coverage(const std::vector<ob::OutboundEvent>& events, Coverage& cov
 
 bool check_coverage(const Coverage& coverage) {
     if (coverage.pool_exhausted == 0 || coverage.price_out_of_band == 0 ||
-        coverage.unknown_handle == 0 || coverage.zero_qty == 0) {
+        coverage.unknown_handle == 0 || coverage.zero_qty == 0 || coverage.ioc_remainder == 0 ||
+        coverage.fok_not_filled == 0 || coverage.self_trade == 0) {
         std::fprintf(stderr,
                      "fuzzer missed required paths: PoolExhausted=%zu PriceOutOfBand=%zu "
-                     "UnknownHandle=%zu ZeroQty=%zu\n",
+                     "UnknownHandle=%zu ZeroQty=%zu IOC=%zu FOK=%zu SelfTrade=%zu\n",
                      coverage.pool_exhausted, coverage.price_out_of_band, coverage.unknown_handle,
-                     coverage.zero_qty);
+                     coverage.zero_qty, coverage.ioc_remainder, coverage.fok_not_filled,
+                     coverage.self_trade);
         return false;
     }
     return true;
@@ -356,6 +388,28 @@ ob::Side random_side(std::mt19937_64& rng) {
     return (rng() & 1u) == 0 ? ob::Side::Bid : ob::Side::Ask;
 }
 
+ob::TimeInForce random_time_in_force(std::mt19937_64& rng) {
+    // Keep most generated limits as ordinary resting orders so the book still
+    // builds depth, while regularly sampling IOC/FOK behavior.
+    switch (rng() % 10) {
+        case 0:
+            return ob::TimeInForce::IOC;
+        case 1:
+            return ob::TimeInForce::FOK;
+        default:
+            return ob::TimeInForce::GTC;
+    }
+}
+
+ob::ParticipantId random_participant(std::mt19937_64& rng) {
+    // Participant 0 means "unassigned"; it must remain common enough that the
+    // self-trade sentinel rule is tested alongside real participant IDs.
+    if ((rng() % 4) == 0) {
+        return 0;
+    }
+    return static_cast<ob::ParticipantId>((rng() % 3) + 1);
+}
+
 bool should_audit(std::size_t op, const FuzzConfig& config) {
     return config.audit_every_ops != 0 && (op % config.audit_every_ops) == 0;
 }
@@ -435,13 +489,15 @@ CommandPair random_command(uint64_t seq, std::mt19937_64& rng, const FuzzerState
     const uint64_t kind = rng() % 100;
     // Bias toward limits so the book usually has liquidity for markets/cancels.
     if (kind < config.limit_weight) {
-        const ob::InboundMsg command = msg(seq, ob::MsgType::NewLimit, random_side(rng),
-                                           random_price<NumLevels>(rng), random_qty(rng));
+        const ob::InboundMsg command =
+            msg(seq, ob::MsgType::NewLimit, random_side(rng), random_price<NumLevels>(rng),
+                random_qty(rng), 0, random_time_in_force(rng), random_participant(rng));
         return {command, command};
     }
     if (kind < config.limit_weight + config.market_weight) {
         const ob::InboundMsg command =
-            msg(seq, ob::MsgType::NewMarket, random_side(rng), 0, random_qty(rng));
+            msg(seq, ob::MsgType::NewMarket, random_side(rng), 0, random_qty(rng), 0,
+                ob::TimeInForce::GTC, random_participant(rng));
         return {command, command};
     }
     return random_cancel(seq, rng, state);
@@ -481,6 +537,18 @@ bool process_and_check(Engine& engine, Reference& reference, FuzzerState& state,
     return true;
 }
 
+template <typename Engine, typename Reference>
+bool process_same_command(Engine& engine, Reference& reference, FuzzerState& state,
+                          Coverage& coverage, const ob::InboundMsg& command, uint64_t seed,
+                          std::size_t& op, const FuzzConfig& config) {
+    if (!process_and_check(engine, reference, state, coverage, {command, command}, seed, op,
+                           config)) {
+        return false;
+    }
+    ++op;
+    return true;
+}
+
 // Run one reproducible random stream.
 template <std::size_t NumLevels, std::size_t PoolCapacity>
 bool run_seed(uint64_t seed, const FuzzConfig& config, Coverage& coverage) {
@@ -493,6 +561,46 @@ bool run_seed(uint64_t seed, const FuzzConfig& config, Coverage& coverage) {
     state.reserve(PoolCapacity);
     std::mt19937_64 rng{seed};
     std::size_t op = 0;
+
+    // These first commands create small, deliberate situations for IOC, FOK,
+    // and self-trade prevention. The later random stream then explores around
+    // those paths instead of being solely responsible for hitting them.
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Ask, 100, 10, 0, ob::TimeInForce::GTC, 1),
+            seed, op, config)) {
+        return false;
+    }
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 100, 25, 0, ob::TimeInForce::IOC, 2),
+            seed, op, config)) {
+        return false;
+    }
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Ask, 100, 10, 0, ob::TimeInForce::GTC, 1),
+            seed, op, config)) {
+        return false;
+    }
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 100, 25, 0, ob::TimeInForce::FOK, 2),
+            seed, op, config)) {
+        return false;
+    }
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 100, 5, 0, ob::TimeInForce::GTC, 1),
+            seed, op, config)) {
+        return false;
+    }
+    if (!process_same_command(
+            *engine, *reference, state, coverage,
+            msg(op + 1, ob::MsgType::NewLimit, ob::Side::Bid, 100, 10, 0, ob::TimeInForce::FOK, 2),
+            seed, op, config)) {
+        return false;
+    }
 
     // Start with a full book once so PoolExhausted is guaranteed, not random.
     // Spread orders across prices so production-size runs do not create one
