@@ -405,6 +405,16 @@ class Book {
         return bitmap_.test(idx);
     }
 
+    // Expose occupied-level scans without exposing the bitmap itself. FOK checks
+    // use these to skip empty prices while preserving the book's public shape.
+    std::optional<std::size_t> occupied_at_or_above(std::size_t idx) const noexcept {
+        return bitmap_.scan_up(idx);
+    }
+
+    std::optional<std::size_t> occupied_at_or_below(std::size_t idx) const noexcept {
+        return bitmap_.scan_down(idx);
+    }
+
     Pool<PoolCapacity>& pool() noexcept {
         return pool_;
     }

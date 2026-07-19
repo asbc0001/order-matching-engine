@@ -327,20 +327,27 @@ class Matcher {
         AggQty available = 0;
 
         if (msg.side == Side::Bid) {
-            for (std::size_t idx = 0; idx <= limit_idx; ++idx) {
-                const FillOrKillCheck result = add_fillable_level(msg, idx, available);
+            auto idx = book_.best_idx(Side::Ask);
+            while (idx && *idx <= limit_idx) {
+                const FillOrKillCheck result = add_fillable_level(msg, *idx, available);
                 if (result != FillOrKillCheck::NotEnoughQuantity) {
                     return result;
                 }
+                idx = *idx + 1 < NumLevels ? book_.occupied_at_or_above(*idx + 1) : std::nullopt;
             }
             return FillOrKillCheck::NotEnoughQuantity;
         }
 
-        for (std::size_t idx = NumLevels; idx-- > limit_idx;) {
-            const FillOrKillCheck result = add_fillable_level(msg, idx, available);
+        auto idx = book_.best_idx(Side::Bid);
+        while (idx && *idx >= limit_idx) {
+            const FillOrKillCheck result = add_fillable_level(msg, *idx, available);
             if (result != FillOrKillCheck::NotEnoughQuantity) {
                 return result;
             }
+            if (*idx == 0) {
+                break;
+            }
+            idx = book_.occupied_at_or_below(*idx - 1);
         }
         return FillOrKillCheck::NotEnoughQuantity;
     }
@@ -358,6 +365,12 @@ class Matcher {
         const Side opposite = msg.side == Side::Bid ? Side::Ask : Side::Bid;
         if (book_.pool().at(level.head).side != opposite) {
             return FillOrKillCheck::NotEnoughQuantity;
+        }
+
+        if (msg.participant_id == 0) {
+            available += level.total_qty;
+            return available >= msg.qty ? FillOrKillCheck::CanFill
+                                        : FillOrKillCheck::NotEnoughQuantity;
         }
 
         // Walk FIFO order. A same-participant order blocks the incoming order;

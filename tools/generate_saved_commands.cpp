@@ -110,8 +110,8 @@ int main(int argc, char** argv) {
                 .limit_weight = 70,
                 .market_weight = 20,
                 .cancel_weight = 10,
-                .gtc_weight = 8,
-                .ioc_weight = 1,
+                .gtc_weight = 65,
+                .ioc_weight = 34,
                 .fok_weight = 1,
                 .participant_count = 50,
             };
