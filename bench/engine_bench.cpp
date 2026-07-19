@@ -34,6 +34,14 @@
 #include "orderbook/trace_replay.hpp"
 #include "orderbook/types.hpp"
 
+#ifndef OB_BUILD_TYPE
+#define OB_BUILD_TYPE "unknown"
+#endif
+
+#ifndef OB_CXX_FLAGS
+#define OB_CXX_FLAGS "unknown"
+#endif
+
 namespace {
 
 using InboundRing = ob::SpscRing<ob::InboundMsg, ob::config::kProduction.ring_capacity>;
@@ -620,6 +628,7 @@ int run_benchmark(const Options& options) {
         static_cast<unsigned long long>(total_commands),
         static_cast<unsigned long long>(options.rate_per_second),
         static_cast<unsigned long long>(options.seed));
+    std::printf("build: type=%s flags=%s\n", OB_BUILD_TYPE, OB_CXX_FLAGS);
     if (options.closed_loop) {
         std::printf("mode=closed_loop\n");
     }
