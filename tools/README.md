@@ -56,6 +56,9 @@ Mixed mode adds IOC/FOK limit orders and participant IDs:
 build/debug/tools/generate_saved_commands output.commands 1000 123 --mixed
 ```
 
+It uses a larger participant pool so self-trade prevention is represented
+without turning most crossing orders into self-trade rejects.
+
 ## run_engine
 
 Replays a saved command file through the threaded engine:

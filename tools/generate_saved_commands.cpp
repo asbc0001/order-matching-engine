@@ -86,7 +86,8 @@ int main(int argc, char** argv) {
             };
         } else if (mode == "--mixed") {
             // A broader generated file for replay and benchmark preparation:
-            // limits, markets, cancels, IOC/FOK, and a small participant pool.
+            // limits, markets, cancels, IOC/FOK, and enough participants that
+            // self-trade rejects stay present without dominating the workload.
             config = ob::synthetic::GeneratorConfig{
                 .limit_weight = 70,
                 .market_weight = 20,
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
                 .gtc_weight = 8,
                 .ioc_weight = 1,
                 .fok_weight = 1,
-                .participant_count = 3,
+                .participant_count = 50,
             };
         } else {
             return usage(argv[0]);
