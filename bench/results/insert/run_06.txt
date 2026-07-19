@@ -1,0 +1,14 @@
+run=6
+started_utc=2026-07-19T16:39:47Z
+measured_commands=1000000 warmup=100000 total_commands=1100000 rate_per_second=100000 seed=7
+build: type=Release flags= 
+input=traces/insert.commands
+cores: producer=0 matcher=1 logger=2
+events=3269799 completed=1000000 latency_samples=1000000
+response_latency_ns: p50=345 p99=1560 p99.9=149081 max=419386 samples=1000000
+scheduler_lateness_ns: p50=59 p99=1101 p99.9=4321 max=276237 samples=1000000
+admission_wait_ns: p50=48 p99=56 p99.9=89 max=14755 samples=1000000
+waits: inbound_full=0 inbound_empty=287581988 outbound_full=0 outbound_empty=293707653
+late_sends=1000000
+exit_code=0
+finished_utc=2026-07-19T16:39:59Z

@@ -1,0 +1,82 @@
+date_utc=2026-07-19T16:32:13Z
+git_commit=d8201c6fd3f65863637160eb818792374029081e
+kernel=Linux orderbook-bench 6.8.0-136-generic #136-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 21:53:05 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+compiler=c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+
+[cpu]
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           39 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  8
+On-line CPU(s) list:                     0-7
+Vendor ID:                               GenuineIntel
+BIOS Vendor ID:                          Intel(R) Corporation
+Model name:                              Intel(R) Xeon(R) CPU E3-1270 v6 @ 3.80GHz
+BIOS Model name:                         Intel(R) Xeon(R) CPU E3-1270 v6 @ 3.80GHz To Be Filled By O.E.M. CPU @ 3.8GHz
+BIOS CPU family:                         179
+CPU family:                              6
+Model:                                   158
+Thread(s) per core:                      2
+Core(s) per socket:                      4
+Socket(s):                               1
+Stepping:                                9
+CPU(s) scaling MHz:                      59%
+CPU max MHz:                             4200.0000
+CPU min MHz:                             800.0000
+BogoMIPS:                                7599.80
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb pti ssbd ibrs ibpb stibp tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust sgx bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi md_clear flush_l1d arch_capabilities ibpb_exit_to_user
+Virtualization:                          VT-x
+L1d cache:                               128 KiB (4 instances)
+L1i cache:                               128 KiB (4 instances)
+L2 cache:                                1 MiB (4 instances)
+L3 cache:                                8 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-7
+Vulnerability Gather data sampling:      Mitigation; Microcode
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             KVM: Mitigation: VMX disabled
+Vulnerability L1tf:                      Mitigation; PTE Inversion; VMX conditional cache flushes, SMT vulnerable
+Vulnerability Mds:                       Mitigation; Clear CPU buffers; SMT vulnerable
+Vulnerability Meltdown:                  Mitigation; PTI
+Vulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT vulnerable
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Mitigation; IBRS
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; IBRS; IBPB conditional; STIBP conditional; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Mitigation; Microcode
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Mitigation; TSX disabled
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+
+[governor]
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu2/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu3/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu5/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu6/cpufreq/scaling_governor=performance
+/sys/devices/system/cpu/cpu7/cpufreq/scaling_governor=performance
+
+[turbo]
+intel_pstate/no_turbo=0
+
+[selected_cores]
+cores=0,1,2
+cpu0
+  thread_siblings=0,4
+  numa_node=node0
+cpu1
+  thread_siblings=1,5
+  numa_node=node0
+cpu2
+  thread_siblings=2,6
+  numa_node=node0
+
+[selected_core_checks]
+selected_cores_share_smt_sibling=no
+selected_cores_single_numa_node=yes
+non-selected SMT siblings must be kept idle by VM setup if SMT is enabled
