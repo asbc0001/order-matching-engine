@@ -83,39 +83,44 @@ bool expect_count(const RecordingSink& sink, std::size_t count, const char* mess
 }
 
 bool expect_reject(const ob::OutboundEvent& event, uint64_t seq, ob::RejectReason reason,
-                   ob::Qty qty, bool done = true) {
+                   ob::Qty qty, bool done = true, ob::ParticipantId participant_id = 0) {
     if (event.type != ob::EventType::Reject || event.client_seq != seq || event.reason != reason ||
-        event.handle != 0 || event.price != 0 || event.qty != qty || complete(event) != done) {
+        event.handle != 0 || event.price != 0 || event.qty != qty || complete(event) != done ||
+        event.participant_id != participant_id) {
         return fail("Reject event mismatch");
     }
     return true;
 }
 
 bool expect_ack_new(const ob::OutboundEvent& event, uint64_t seq, ob::Price price, ob::Qty qty,
-                    ob::Side side) {
+                    ob::Side side, ob::ParticipantId participant_id = 0) {
     if (event.type != ob::EventType::AckNew || event.client_seq != seq || event.handle == 0 ||
         event.price != price || event.qty != qty || event.side != side ||
-        event.reason != ob::RejectReason::None || !complete(event)) {
+        event.reason != ob::RejectReason::None || !complete(event) ||
+        event.participant_id != participant_id) {
         return fail("AckNew event mismatch");
     }
     return true;
 }
 
 bool expect_ack_cancel(const ob::OutboundEvent& event, uint64_t seq, ob::Handle handle,
-                       ob::Price price, ob::Qty qty, ob::Side side) {
+                       ob::Price price, ob::Qty qty, ob::Side side,
+                       ob::ParticipantId participant_id = 0) {
     if (event.type != ob::EventType::AckCancel || event.client_seq != seq ||
         event.handle != handle || event.price != price || event.qty != qty || event.side != side ||
-        event.reason != ob::RejectReason::None || !complete(event)) {
+        event.reason != ob::RejectReason::None || !complete(event) ||
+        event.participant_id != participant_id) {
         return fail("AckCancel event mismatch");
     }
     return true;
 }
 
 bool expect_fill(const ob::OutboundEvent& event, uint64_t seq, ob::Handle handle, ob::Price price,
-                 ob::Qty qty, ob::Side side, bool done) {
+                 ob::Qty qty, ob::Side side, bool done, ob::ParticipantId participant_id = 0) {
     if (event.type != ob::EventType::Fill || event.client_seq != seq || event.handle != handle ||
         event.price != price || event.qty != qty || event.side != side ||
-        event.reason != ob::RejectReason::None || complete(event) != done) {
+        event.reason != ob::RejectReason::None || complete(event) != done ||
+        event.participant_id != participant_id) {
         return fail("Fill event mismatch");
     }
     return true;
@@ -127,7 +132,7 @@ std::optional<ob::Handle> rest_limit(Matcher& matcher, uint64_t seq, ob::Side si
     RecordingSink sink;
     matcher.process(limit_msg(seq, side, price, qty, ob::TimeInForce::GTC, participant_id), sink);
     if (!expect_count(sink, 1, "rest setup did not emit one complete event") ||
-        !expect_ack_new(sink.events[0], seq, price, qty, side)) {
+        !expect_ack_new(sink.events[0], seq, price, qty, side, participant_id)) {
         return std::nullopt;
     }
     return sink.events[0].handle;
@@ -389,7 +394,7 @@ bool check_self_trade_rejects_incoming_order() {
     matcher.process(limit_msg(161, ob::Side::Bid, 100, 5, ob::TimeInForce::GTC, 7), sink);
     const ob::Order* resting = matcher.book().pool().resolve(*ask);
     return expect_count(sink, 1, "self-trade reject event count failed") &&
-           expect_reject(sink.events[0], 161, ob::RejectReason::SelfTrade, 5) &&
+           expect_reject(sink.events[0], 161, ob::RejectReason::SelfTrade, 5, true, 7) &&
            resting != nullptr && resting->remaining == 10 && matcher.book().audit();
 }
 
@@ -405,9 +410,39 @@ bool check_different_participants_can_cross() {
     matcher.process(limit_msg(171, ob::Side::Bid, 100, 5, ob::TimeInForce::GTC, 8), sink);
     const ob::Order* resting = matcher.book().pool().resolve(*ask);
     return expect_count(sink, 2, "different-participant fill event count failed") &&
-           expect_fill(sink.events[0], 170, *ask, 100, 5, ob::Side::Ask, false) &&
-           expect_fill(sink.events[1], 171, 0, 100, 5, ob::Side::Bid, true) && resting != nullptr &&
-           resting->remaining == 5 && matcher.book().audit();
+           expect_fill(sink.events[0], 170, *ask, 100, 5, ob::Side::Ask, false, 7) &&
+           expect_fill(sink.events[1], 171, 0, 100, 5, ob::Side::Bid, true, 8) &&
+           resting != nullptr && resting->remaining == 5 && matcher.book().audit();
+}
+
+// TCP responses will be routed by participant_id. Resting-party fills must go
+// to the resting order's participant, while aggressor events go to the sender.
+bool check_events_carry_routing_participant() {
+    TestMatcher matcher;
+    const auto ask = rest_limit(matcher, 180, ob::Side::Ask, 100, 10, 11);
+    if (!ask) {
+        return false;
+    }
+
+    RecordingSink fill_sink;
+    matcher.process(limit_msg(181, ob::Side::Bid, 100, 5, ob::TimeInForce::GTC, 22), fill_sink);
+
+    const auto bid = rest_limit(matcher, 182, ob::Side::Bid, 99, 7, 33);
+    if (!bid) {
+        return false;
+    }
+
+    RecordingSink cancel_sink;
+    ob::InboundMsg cancel = cancel_msg(183, *bid);
+    cancel.participant_id = 33;
+    matcher.process(cancel, cancel_sink);
+
+    return expect_count(fill_sink, 2, "participant-routed fill event count failed") &&
+           expect_fill(fill_sink.events[0], 180, *ask, 100, 5, ob::Side::Ask, false, 11) &&
+           expect_fill(fill_sink.events[1], 181, 0, 100, 5, ob::Side::Bid, true, 22) &&
+           expect_count(cancel_sink, 1, "participant-routed cancel event count failed") &&
+           expect_ack_cancel(cancel_sink.events[0], 183, *bid, 99, 7, ob::Side::Bid, 33) &&
+           matcher.book().audit();
 }
 
 // A valid cancel should remove the resting order and report its removed fields.
@@ -479,7 +514,7 @@ bool check_request_complete_across_representative_paths() {
 
 int main() {
     using Check = bool (*)();
-    constexpr std::array<Check, 20> checks{
+    constexpr std::array<Check, 21> checks{
         check_limit_validation_rejects,
         check_limit_rests_and_acknowledges_handle,
         check_market_empty_rejects,
@@ -496,6 +531,7 @@ int main() {
         check_fok_exact_liquidity_fills_fully,
         check_self_trade_rejects_incoming_order,
         check_different_participants_can_cross,
+        check_events_carry_routing_participant,
         check_cancel_acknowledges_and_removes,
         check_unknown_cancel_rejects,
         check_stop_engine_emits_internal_event,

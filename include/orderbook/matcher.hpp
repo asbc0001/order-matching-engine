@@ -106,8 +106,9 @@ class Matcher {
     }
 
     // Start every event from the inbound request identity. Specific builders
-    // fill in the fields meaningful for each event type. tsc_egress is left at
-    // zero until timing support is added.
+    // fill in the fields meaningful for each event type. participant_id routes
+    // responses back to the submitting TCP connection; trace/benchmark inputs
+    // leave it as 0.
     static OutboundEvent base_event(const InboundMsg& msg) noexcept {
         return OutboundEvent{
             .client_seq = msg.client_seq,
@@ -118,6 +119,7 @@ class Matcher {
             .type = EventType::Reject,
             .reason = RejectReason::None,
             .flags = 0,
+            .participant_id = msg.participant_id,
             .tsc_intended = msg.tsc_intended,
             .tsc_egress = 0,
         };
@@ -164,6 +166,7 @@ class Matcher {
         event.qty = qty;
         event.side = resting.side;
         event.type = EventType::Fill;
+        event.participant_id = resting.participant_id;
         return event;
     }
 

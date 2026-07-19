@@ -91,10 +91,12 @@ struct alignas(64) OutboundEvent {
                 // evolution without extra side-channel data
     EventType type;
     RejectReason reason;
-    uint8_t flags;          // RequestComplete marks the final event for
-                            // an inbound request.
-    uint64_t tsc_intended;  // copied through
-    uint64_t tsc_egress;    // taken at event creation
+    uint8_t flags;                    // RequestComplete marks the final event for
+                                      // an inbound request.
+    ParticipantId participant_id{0};  // internal routing key for TCP responses;
+                                      // files and sockets do not serialize it
+    uint64_t tsc_intended;            // copied through
+    uint64_t tsc_egress;              // taken at event creation
 };
 
 // Active order stored in the engine-owned pool while it rests in the book. The

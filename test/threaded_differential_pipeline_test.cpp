@@ -91,7 +91,7 @@ class HandleMap {
         if (engine.client_seq != reference.client_seq || engine.price != reference.price ||
             engine.qty != reference.qty || engine.side != reference.side ||
             engine.type != reference.type || engine.reason != reference.reason ||
-            engine.flags != reference.flags) {
+            engine.flags != reference.flags || engine.participant_id != reference.participant_id) {
             return false;
         }
 

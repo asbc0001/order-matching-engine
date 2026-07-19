@@ -114,6 +114,7 @@ class ReferenceBook {
             .type = EventType::Reject,
             .reason = RejectReason::None,
             .flags = 0,
+            .participant_id = msg.participant_id,
             .tsc_intended = msg.tsc_intended,
             .tsc_egress = 0,
         };
@@ -155,6 +156,7 @@ class ReferenceBook {
         event.qty = qty;
         event.side = resting.side;
         event.type = EventType::Fill;
+        event.participant_id = resting.participant_id;
         return event;
     }
 
