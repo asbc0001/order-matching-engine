@@ -40,24 +40,25 @@ Usage:
 build/debug/tools/generate_saved_commands output.commands 1000 123
 ```
 
-Cancel-heavy mode:
+Benchmark workload modes:
 
 ```bash
+build/debug/tools/generate_saved_commands output.commands 1000 123 --insert-heavy
 build/debug/tools/generate_saved_commands output.commands 1000 123 --cancel-heavy
+build/debug/tools/generate_saved_commands output.commands 1000 123 --cross-heavy
+build/debug/tools/generate_saved_commands output.commands 1000 123 --mixed
 ```
 
 The generator runs commands through the matcher while writing the file. That
 lets later generated cancels use real handles assigned by earlier accepted
 orders.
 
-Mixed mode adds IOC/FOK limit orders and participant IDs:
-
-```bash
-build/debug/tools/generate_saved_commands output.commands 1000 123 --mixed
-```
-
-It uses a larger participant pool so self-trade prevention is represented
-without turning most crossing orders into self-trade rejects.
+`--insert-heavy` mostly creates resting limit orders. `--cancel-heavy` creates
+valid cancels from real handles. `--cross-heavy` builds resting liquidity and
+then consumes it with market orders. `--mixed` includes limits, markets,
+cancels, IOC/FOK, and participant IDs; it uses a larger participant pool so
+self-trade prevention is represented without turning most crossing orders into
+self-trade rejects.
 
 ## run_engine
 

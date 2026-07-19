@@ -31,9 +31,9 @@ struct GeneratorConfig {
     // 0 keeps all commands unassigned. A nonzero value chooses participant IDs
     // from 1..participant_count so self-trade paths can be exercised on demand.
     std::uint8_t participant_count{0};
-    // When true, CANCEL commands are only made from handles learned through
-    // observe(). This is used for saved command files that should replay
-    // without UnknownHandle rejects.
+    // When true, generated limit orders are safe resting setup orders, and
+    // CANCEL commands only use handles learned through observe(). This is for
+    // saved files that should replay without accidental crossing or bad cancels.
     bool valid_cancels_only{false};
 };
 

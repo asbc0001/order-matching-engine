@@ -54,7 +54,7 @@ bool write_bytes(std::FILE* file, const std::uint8_t* bytes, std::size_t size, c
 int usage(const char* program) {
     std::fprintf(stderr,
                  "usage: %s <output.commands> <command_count> <seed> "
-                 "[--cancel-heavy|--mixed]\n",
+                 "[--insert-heavy|--cancel-heavy|--cross-heavy|--mixed]\n",
                  program);
     return 2;
 }
@@ -75,13 +75,31 @@ int main(int argc, char** argv) {
     ob::synthetic::GeneratorConfig config;
     if (argc == 5) {
         const std::string_view mode{argv[4]};
-        if (mode == "--cancel-heavy") {
+        if (mode == "--insert-heavy") {
+            // Mostly resting limit orders. The occasional market order keeps
+            // the path honest without turning this into a crossing workload.
+            config = ob::synthetic::GeneratorConfig{
+                .limit_weight = 98,
+                .market_weight = 2,
+                .cancel_weight = 0,
+                .valid_cancels_only = true,
+            };
+        } else if (mode == "--cancel-heavy") {
             // Bias toward cancels while still generating enough new limits for
             // the generator to learn real live handles from matcher output.
             config = ob::synthetic::GeneratorConfig{
                 .limit_weight = 50,
                 .market_weight = 0,
                 .cancel_weight = 50,
+                .valid_cancels_only = true,
+            };
+        } else if (mode == "--cross-heavy") {
+            // Keep creating resting liquidity while sending many market orders,
+            // so the saved file contains frequent fills.
+            config = ob::synthetic::GeneratorConfig{
+                .limit_weight = 45,
+                .market_weight = 55,
+                .cancel_weight = 0,
                 .valid_cancels_only = true,
             };
         } else if (mode == "--mixed") {
