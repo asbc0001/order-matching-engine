@@ -1,8 +1,9 @@
-// tcp_server.cpp - Minimal one-client TCP proof for the threaded engine.
+// tcp_server.cpp - Small TCP server for exercising the threaded engine.
 //
-// This is not the final multi-client server. It proves the basic path first:
-// encoded socket command -> inbound ring -> matcher -> outbound ring -> socket
-// response. The producer reads; the logger writes and owns close().
+// This is still a development tool, not the final production server. It accepts
+// a fixed number of local clients, decodes fixed-size command records from each
+// socket, runs the existing matcher pipeline, and sends fixed-size event records
+// back to the participant that owns each event.
 
 #include <cerrno>
 #include <csignal>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -38,32 +40,50 @@ using EngineLoop =
                      ob::config::kProduction.ring_capacity, ob::config::kProduction.ring_capacity>;
 
 constexpr std::uint16_t kDefaultPort = 9001;
-constexpr int kEpollEvents = 4;
+constexpr std::size_t kDefaultClientCount = 1;
+constexpr int kEpollEvents = 16;
 
 struct Options {
     std::uint16_t port{kDefaultPort};
+    std::size_t clients{kDefaultClientCount};
     ob::WaitMode wait_mode{ob::WaitMode::Spin};
 };
 
-struct SharedConnection {
+// The table has two views of the same connections:
+//   fd -> participant_id for the producer read path
+//   participant_id -> connection for the logger response path
+struct ConnectionTable {
     std::mutex mutex;
-    ob::tcp::ConnectionState state;
+    std::unordered_map<int, ob::ParticipantId> participant_by_fd;
+    std::unordered_map<ob::ParticipantId, std::unique_ptr<ob::tcp::ConnectionState>> by_participant;
+    std::size_t accepted{0};
+    std::size_t active_readers{0};
+    bool accepting_done{false};
 };
 
-// Keep this proof tool intentionally small: one optional port plus --yield.
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s [port] [--yield]\n", program);
+    std::fprintf(stderr, "usage: %s [port] [--clients N] [--yield]\n", program);
     return 2;
 }
 
-bool parse_port(std::string_view text, std::uint16_t& port) {
+bool parse_u16(std::string_view text, std::uint16_t& value) {
     unsigned parsed = 0;
     char tail = '\0';
     if (std::sscanf(std::string{text}.c_str(), "%u%c", &parsed, &tail) != 1 || parsed == 0 ||
         parsed > 65535) {
         return false;
     }
-    port = static_cast<std::uint16_t>(parsed);
+    value = static_cast<std::uint16_t>(parsed);
+    return true;
+}
+
+bool parse_size(std::string_view text, std::size_t& value) {
+    unsigned long long parsed = 0;
+    char tail = '\0';
+    if (std::sscanf(std::string{text}.c_str(), "%llu%c", &parsed, &tail) != 1 || parsed == 0) {
+        return false;
+    }
+    value = static_cast<std::size_t>(parsed);
     return true;
 }
 
@@ -75,7 +95,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.wait_mode = ob::WaitMode::Yield;
             continue;
         }
-        if (saw_port || !parse_port(arg, options.port)) {
+        if (arg == "--clients") {
+            if (i + 1 >= argc || !parse_size(argv[++i], options.clients) ||
+                options.clients > ob::config::MAX_CLIENTS) {
+                return false;
+            }
+            continue;
+        }
+        if (saw_port || !parse_u16(arg, options.port)) {
             return false;
         }
         saw_port = true;
@@ -83,8 +110,8 @@ bool parse_options(int argc, char** argv, Options& options) {
     return true;
 }
 
-// Create a loopback-only listener. This is for local development and tests, not
-// for accepting public network traffic.
+// Create a loopback-only listener. This keeps the tool local while still using
+// real TCP sockets and the kernel's normal stream behavior.
 int make_listener(std::uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
@@ -116,8 +143,6 @@ int make_listener(std::uint16_t port) {
     return fd;
 }
 
-// The producer thread watches sockets for readable bytes. The final server will
-// add many client fds here; this proof only adds the listener and then one fd.
 bool add_epoll_in(int epoll_fd, int fd) {
     epoll_event event{};
     event.events = EPOLLIN;
@@ -125,8 +150,8 @@ bool add_epoll_in(int epoll_fd, int fd) {
     return ::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == 0;
 }
 
-// Push into the engine's inbound ring without dropping commands. A full ring is
-// backpressure inside the process, so this waits until the matcher catches up.
+// Push into the engine without dropping commands. If the ring is temporarily
+// full, the producer waits until the matcher catches up.
 void push_command(InboundRing& inbound, const ob::InboundMsg& input,
                   ob::WaitMode wait_mode) noexcept {
     ob::InboundMsg msg = input;
@@ -157,68 +182,110 @@ void push_stop(InboundRing& inbound, ob::WaitMode wait_mode) noexcept {
                  wait_mode);
 }
 
-// The producer does not close the socket. It only stops watching reads and
-// tells the logger that input has ended, preserving one close owner.
-void mark_read_closed(int epoll_fd, SharedConnection& shared) {
-    std::lock_guard lock{shared.mutex};
-    if (shared.state.fd >= 0) {
-        (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, shared.state.fd, nullptr);
+// epoll gives the producer an fd. The connection itself is stored by
+// participant_id so the logger can route events the same way.
+ob::tcp::ConnectionState* connection_for_fd(ConnectionTable& table, int fd) {
+    std::lock_guard lock{table.mutex};
+    const auto id = table.participant_by_fd.find(fd);
+    if (id == table.participant_by_fd.end()) {
+        return nullptr;
     }
-    shared.state.read_closed.store(true, std::memory_order_release);
+    const auto connection = table.by_participant.find(id->second);
+    return connection == table.by_participant.end() ? nullptr : connection->second.get();
 }
 
-int accepted_fd(const SharedConnection& shared) {
-    return shared.state.fd;
-}
+// Producer-side close handling: stop watching reads and mark the connection.
+// The actual close still belongs to the logger side.
+bool mark_read_closed(int epoll_fd, ConnectionTable& table, int fd) {
+    (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
 
-bool accept_one_client(int listen_fd, int epoll_fd, SharedConnection& shared,
-                       ob::tcp::ParticipantIdSource& ids) {
-    sockaddr_in addr{};
-    socklen_t addr_len = sizeof(addr);
-    const int client_fd =
-        ::accept4(listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len, SOCK_NONBLOCK);
-    if (client_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::perror("accept4");
-        }
-        return false;
+    std::lock_guard lock{table.mutex};
+    const auto id = table.participant_by_fd.find(fd);
+    if (id == table.participant_by_fd.end()) {
+        return table.accepting_done && table.active_readers == 0;
     }
 
+    auto& connection = *table.by_participant.at(id->second);
+    if (!connection.read_closed.exchange(true, std::memory_order_acq_rel)) {
+        --table.active_readers;
+    }
+    table.participant_by_fd.erase(id);
+    return table.accepting_done && table.active_readers == 0;
+}
+
+bool set_tcp_nodelay(int fd) {
     const int yes = 1;
-    if (::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) != 0) {
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) != 0) {
         std::perror("setsockopt(TCP_NODELAY)");
-        ::close(client_fd);
         return false;
     }
-
-    {
-        std::lock_guard lock{shared.mutex};
-        shared.state.fd = client_fd;
-        shared.state.participant_id = ids.take();
-        shared.state.read_buf.assign(ob::config::READ_BUF_INITIAL_BYTES, 0);
-        shared.state.read_size = 0;
-        shared.state.write_buf.reserve(ob::config::WRITE_BUF_CAP_BYTES);
-    }
-
-    if (!add_epoll_in(epoll_fd, client_fd)) {
-        std::perror("epoll_ctl(client)");
-        ::close(client_fd);
-        return false;
-    }
-
-    // This is the deliberate one-client limit. The multi-client version should
-    // keep listening and store each accepted client in a connection table.
-    (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listen_fd, nullptr);
-    std::printf("accepted client participant=%u\n", shared.state.participant_id);
     return true;
 }
 
+bool add_client(ConnectionTable& table, int client_fd, ob::ParticipantId participant_id) {
+    auto connection = std::make_unique<ob::tcp::ConnectionState>(client_fd, participant_id);
+
+    std::lock_guard lock{table.mutex};
+    table.participant_by_fd[client_fd] = participant_id;
+    table.by_participant.emplace(participant_id, std::move(connection));
+    ++table.accepted;
+    ++table.active_readers;
+    return true;
+}
+
+void stop_accepting(int epoll_fd, int listen_fd, ConnectionTable& table) {
+    (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listen_fd, nullptr);
+    std::lock_guard lock{table.mutex};
+    table.accepting_done = true;
+}
+
+// Accept every queued client until the kernel says there are no more ready.
+// Participant ids are assigned by the server, never by fd or client input.
+bool accept_ready_clients(int listen_fd, int epoll_fd, ConnectionTable& table,
+                          ob::tcp::ParticipantIdSource& ids, std::size_t target_clients) {
+    for (;;) {
+        if (table.accepted >= target_clients) {
+            stop_accepting(epoll_fd, listen_fd, table);
+            return true;
+        }
+
+        sockaddr_in addr{};
+        socklen_t addr_len = sizeof(addr);
+        const int client_fd =
+            ::accept4(listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len, SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;
+            }
+            std::perror("accept4");
+            return false;
+        }
+
+        if (!set_tcp_nodelay(client_fd)) {
+            ::close(client_fd);
+            return false;
+        }
+        const ob::ParticipantId participant_id = ids.take();
+        if (participant_id == 0) {
+            std::fprintf(stderr, "participant id space exhausted\n");
+            ::close(client_fd);
+            return false;
+        }
+        if (!add_epoll_in(epoll_fd, client_fd)) {
+            std::perror("epoll_ctl(client)");
+            ::close(client_fd);
+            return false;
+        }
+        add_client(table, client_fd, participant_id);
+        std::printf("accepted client participant=%u\n", participant_id);
+    }
+}
+
 // Decode every complete fixed-size command already buffered. Any leftover bytes
-// stay at the front of read_buf for the next recv(), which is what lets this
-// handle TCP fragmentation.
-bool decode_buffered_commands(SharedConnection& shared, InboundRing& inbound,
+// stay at the front of read_buf for the next recv(), which handles fragmented
+// TCP input naturally.
+bool decode_buffered_commands(ob::tcp::ConnectionState& connection, InboundRing& inbound,
                               ob::WaitMode wait_mode) {
-    ob::tcp::ConnectionState& connection = shared.state;
     constexpr std::size_t record_size = ob::codec::ENCODED_INBOUND_SIZE;
     std::size_t offset = 0;
 
@@ -233,8 +300,7 @@ bool decode_buffered_commands(SharedConnection& shared, InboundRing& inbound,
         }
 
         ob::InboundMsg msg = decoded.value;
-        // TCP assigns identity from the accepted connection, not from client
-        // bytes. That keeps self-trade and response routing under server control.
+        // TCP identity comes from accept(), not from bytes supplied by clients.
         msg.participant_id = connection.participant_id;
         msg.tsc_intended = ob::engine_time_nanos();
         push_command(inbound, msg, wait_mode);
@@ -249,30 +315,32 @@ bool decode_buffered_commands(SharedConnection& shared, InboundRing& inbound,
     return true;
 }
 
-// Drain currently-readable bytes from the accepted client. Level-triggered
-// epoll will wake us again if more bytes remain later.
-bool read_client_commands(int epoll_fd, SharedConnection& shared, InboundRing& inbound,
-                          ob::WaitMode wait_mode) {
-    ob::tcp::ConnectionState& connection = shared.state;
+// Drain the currently-readable bytes for one client. Level-triggered epoll will
+// wake us again if more bytes remain later.
+bool read_client_commands(int epoll_fd, ConnectionTable& table, int fd, InboundRing& inbound,
+                          ob::WaitMode wait_mode, bool& all_clients_closed) {
+    ob::tcp::ConnectionState* connection = connection_for_fd(table, fd);
+    if (connection == nullptr) {
+        return true;
+    }
+
     for (;;) {
-        if (connection.read_size == connection.read_buf.size()) {
-            connection.read_buf.resize(connection.read_buf.size() * 2);
+        if (connection->read_size == connection->read_buf.size()) {
+            connection->read_buf.resize(connection->read_buf.size() * 2);
         }
 
-        const ssize_t n = ::recv(connection.fd, connection.read_buf.data() + connection.read_size,
-                                 connection.read_buf.size() - connection.read_size, 0);
+        const ssize_t n = ::recv(fd, connection->read_buf.data() + connection->read_size,
+                                 connection->read_buf.size() - connection->read_size, 0);
         if (n > 0) {
-            connection.read_size += static_cast<std::size_t>(n);
-            if (!decode_buffered_commands(shared, inbound, wait_mode)) {
-                mark_read_closed(epoll_fd, shared);
-                push_stop(inbound, wait_mode);
+            connection->read_size += static_cast<std::size_t>(n);
+            if (!decode_buffered_commands(*connection, inbound, wait_mode)) {
+                all_clients_closed = mark_read_closed(epoll_fd, table, fd);
                 return false;
             }
             continue;
         }
         if (n == 0) {
-            mark_read_closed(epoll_fd, shared);
-            push_stop(inbound, wait_mode);
+            all_clients_closed = mark_read_closed(epoll_fd, table, fd);
             return true;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -280,24 +348,23 @@ bool read_client_commands(int epoll_fd, SharedConnection& shared, InboundRing& i
         }
 
         std::perror("recv");
-        mark_read_closed(epoll_fd, shared);
-        push_stop(inbound, wait_mode);
+        all_clients_closed = mark_read_closed(epoll_fd, table, fd);
         return false;
     }
 }
 
-bool run_producer(int listen_fd, SharedConnection& shared, InboundRing& inbound,
-                  ob::WaitMode wait_mode) {
+bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
+                  const Options& options) {
     const int epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
         std::perror("epoll_create1");
-        push_stop(inbound, wait_mode);
+        push_stop(inbound, options.wait_mode);
         return false;
     }
     if (!add_epoll_in(epoll_fd, listen_fd)) {
         std::perror("epoll_ctl(listen)");
         ::close(epoll_fd);
-        push_stop(inbound, wait_mode);
+        push_stop(inbound, options.wait_mode);
         return false;
     }
 
@@ -312,39 +379,43 @@ bool run_producer(int listen_fd, SharedConnection& shared, InboundRing& inbound,
                 continue;
             }
             std::perror("epoll_wait");
-            push_stop(inbound, wait_mode);
             ok = false;
             break;
         }
 
         for (int i = 0; i < count && !done; ++i) {
             if (events[i].data.fd == listen_fd) {
-                ok = accept_one_client(listen_fd, epoll_fd, shared, ids);
+                ok = accept_ready_clients(listen_fd, epoll_fd, table, ids, options.clients);
                 if (!ok) {
-                    push_stop(inbound, wait_mode);
                     done = true;
                 }
             } else {
-                ok = read_client_commands(epoll_fd, shared, inbound, wait_mode);
-                if (shared.state.read_closed.load(std::memory_order_acquire)) {
-                    done = true;
-                }
+                bool all_clients_closed = false;
+                ok = read_client_commands(epoll_fd, table, events[i].data.fd, inbound,
+                                          options.wait_mode, all_clients_closed);
+                done = all_clients_closed || !ok;
             }
         }
     }
 
     ::close(epoll_fd);
+    push_stop(inbound, options.wait_mode);
     return ok;
 }
 
-int current_client_fd(SharedConnection& shared) {
-    std::lock_guard lock{shared.mutex};
-    return accepted_fd(shared);
+int fd_for_participant(ConnectionTable& table, ob::ParticipantId participant_id) {
+    std::lock_guard lock{table.mutex};
+    const auto found = table.by_participant.find(participant_id);
+    if (found == table.by_participant.end() ||
+        found->second->closed.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    return found->second->fd;
 }
 
-// Proof-only writer: send this one response before processing the next event.
-// The final multi-client logger needs bounded per-client buffers plus EPOLLOUT
-// so a slow reader cannot delay the outbound ring drain.
+// Temporary writer for this stage: route one event and write it immediately.
+// The next TCP slice replaces this with bounded buffers plus EPOLLOUT so slow
+// clients cannot delay the logger.
 bool write_all(int fd, std::span<const std::uint8_t> bytes, ob::WaitMode wait_mode) {
     std::size_t written = 0;
     while (written < bytes.size()) {
@@ -363,19 +434,20 @@ bool write_all(int fd, std::span<const std::uint8_t> bytes, ob::WaitMode wait_mo
     return true;
 }
 
-// Logger owns close(). That remains true even in this one-client proof, because
-// it is the rule that prevents fd reuse bugs once multiple clients exist.
-void logger_close_client(SharedConnection& shared) {
-    std::lock_guard lock{shared.mutex};
-    if (shared.state.fd >= 0 && !shared.state.closed.exchange(true, std::memory_order_acq_rel)) {
-        ::close(shared.state.fd);
-        shared.state.fd = -1;
+// Logger owns socket close. The producer has already removed closed readers
+// from its epoll set before StopEngine is sent, so closing here cannot race with
+// producer reads in the normal shutdown path.
+void close_all_clients(ConnectionTable& table) {
+    std::lock_guard lock{table.mutex};
+    for (auto& [_, connection] : table.by_participant) {
+        if (connection->fd >= 0 && !connection->closed.exchange(true, std::memory_order_acq_rel)) {
+            ::close(connection->fd);
+            connection->fd = -1;
+        }
     }
 }
 
-// Logger thread side: consume matcher events and write them back to the single
-// accepted client. Routing by participant_id comes in the multi-client version.
-bool run_logger(OutboundRing& outbound, SharedConnection& shared, ob::WaitMode wait_mode) {
+bool run_logger(OutboundRing& outbound, ConnectionTable& table, ob::WaitMode wait_mode) {
     ob::OutboundEvent event{};
     bool ok = true;
     for (;;) {
@@ -385,21 +457,18 @@ bool run_logger(OutboundRing& outbound, SharedConnection& shared, ob::WaitMode w
         }
 
         if (event.type == ob::EventType::StopEngine) {
-            logger_close_client(shared);
+            close_all_clients(table);
             return ok;
         }
 
-        const int fd = current_client_fd(shared);
+        const int fd = fd_for_participant(table, event.participant_id);
         if (fd < 0) {
             ok = false;
             continue;
         }
 
         const auto bytes = ob::codec::encode_outbound(event);
-        if (!write_all(fd, bytes, wait_mode)) {
-            ok = false;
-            logger_close_client(shared);
-        }
+        ok = write_all(fd, bytes, wait_mode) && ok;
     }
 }
 
@@ -410,20 +479,19 @@ int run_server(const Options& options) {
     if (listen_fd < 0) {
         return 1;
     }
-    std::printf("listening on 127.0.0.1:%u\n", options.port);
+    std::printf("listening on 127.0.0.1:%u for %zu client(s)\n", options.port, options.clients);
 
     auto inbound = std::make_unique<InboundRing>();
     auto outbound = std::make_unique<OutboundRing>();
     auto loop = std::make_unique<EngineLoop>(*inbound, *outbound);
-    SharedConnection shared;
+    ConnectionTable table;
     ob::MatchingLoopStats matching_stats{};
     bool producer_ok = false;
 
-    std::thread producer{
-        [&] { producer_ok = run_producer(listen_fd, shared, *inbound, options.wait_mode); }};
+    std::thread producer{[&] { producer_ok = run_producer(listen_fd, table, *inbound, options); }};
     std::thread matcher{[&] { matching_stats = loop->run_until_stop(options.wait_mode); }};
 
-    const bool logger_ok = run_logger(*outbound, shared, options.wait_mode);
+    const bool logger_ok = run_logger(*outbound, table, options.wait_mode);
 
     producer.join();
     matcher.join();
