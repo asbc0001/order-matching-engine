@@ -30,6 +30,7 @@ struct ConnectionState {
     // WRITE_BUF_CAP_BYTES; after that the logger disconnects the client.
     std::vector<std::uint8_t> write_buf{};
     std::size_t write_offset{0};
+    bool write_registered{false};
 
     // Producer sets read_closed after EOF, a read error, or malformed input.
     // Logger observes it and closes the fd once any queued writes are flushed.

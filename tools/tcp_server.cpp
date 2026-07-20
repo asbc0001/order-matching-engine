@@ -16,6 +16,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -403,72 +404,219 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
     return ok;
 }
 
-int fd_for_participant(ConnectionTable& table, ob::ParticipantId participant_id) {
+ob::tcp::ConnectionState* connection_for_participant(ConnectionTable& table,
+                                                     ob::ParticipantId participant_id) {
     std::lock_guard lock{table.mutex};
     const auto found = table.by_participant.find(participant_id);
     if (found == table.by_participant.end() ||
         found->second->closed.load(std::memory_order_acquire)) {
-        return -1;
+        return nullptr;
     }
-    return found->second->fd;
+    return found->second.get();
 }
 
-// Temporary writer for this stage: route one event and write it immediately.
-// The next TCP slice replaces this with bounded buffers plus EPOLLOUT so slow
-// clients cannot delay the logger.
-bool write_all(int fd, std::span<const std::uint8_t> bytes, ob::WaitMode wait_mode) {
-    std::size_t written = 0;
-    while (written < bytes.size()) {
-        const ssize_t n = ::send(fd, bytes.data() + written, bytes.size() - written, 0);
-        if (n > 0) {
-            written += static_cast<std::size_t>(n);
-            continue;
-        }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-            ob::matching_loop_wait(wait_mode);
-            continue;
-        }
-        std::perror("send");
+bool add_epoll_out(int epoll_fd, ob::tcp::ConnectionState& connection) {
+    if (connection.write_registered) {
+        return true;
+    }
+
+    epoll_event event{};
+    event.events = EPOLLOUT;
+    event.data.fd = connection.fd;
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection.fd, &event) != 0) {
+        std::perror("epoll_ctl(EPOLLOUT add)");
         return false;
     }
+    connection.write_registered = true;
     return true;
 }
 
-// Logger owns socket close. The producer has already removed closed readers
-// from its epoll set before StopEngine is sent, so closing here cannot race with
-// producer reads in the normal shutdown path.
-void close_all_clients(ConnectionTable& table) {
+bool remove_epoll_out(int epoll_fd, ob::tcp::ConnectionState& connection) {
+    if (!connection.write_registered) {
+        return true;
+    }
+
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection.fd, nullptr) != 0 && errno != ENOENT) {
+        std::perror("epoll_ctl(EPOLLOUT del)");
+        return false;
+    }
+    connection.write_registered = false;
+    return true;
+}
+
+// Logger owns socket close. During the run we keep the ConnectionState object
+// alive because the producer may already have a non-owning pointer to its read
+// buffer. Removing the fd lookup is enough to prevent stale socket use.
+void close_client(ConnectionTable& table, int write_epoll_fd,
+                  ob::tcp::ConnectionState& connection) {
+    const int fd = connection.fd;
+
+    (void)remove_epoll_out(write_epoll_fd, connection);
+    if (fd >= 0 && !connection.closed.exchange(true, std::memory_order_acq_rel)) {
+        ::close(fd);
+        connection.fd = -1;
+    }
+
     std::lock_guard lock{table.mutex};
-    for (auto& [_, connection] : table.by_participant) {
-        if (connection->fd >= 0 && !connection->closed.exchange(true, std::memory_order_acq_rel)) {
-            ::close(connection->fd);
-            connection->fd = -1;
+    table.participant_by_fd.erase(fd);
+}
+
+// Try to write whatever is already buffered for this client. If the socket
+// would block, keep the remaining bytes and wait for EPOLLOUT.
+bool flush_client(ConnectionTable& table, int write_epoll_fd,
+                  ob::tcp::ConnectionState& connection) {
+    while (connection.write_offset < connection.write_buf.size()) {
+        const std::size_t remaining = connection.write_buf.size() - connection.write_offset;
+        const ssize_t n =
+            ::send(connection.fd, connection.write_buf.data() + connection.write_offset, remaining,
+                   MSG_NOSIGNAL);
+        if (n > 0) {
+            connection.write_offset += static_cast<std::size_t>(n);
+            continue;
         }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return add_epoll_out(write_epoll_fd, connection);
+        }
+
+        std::perror("send");
+        close_client(table, write_epoll_fd, connection);
+        return true;
+    }
+
+    connection.write_buf.clear();
+    connection.write_offset = 0;
+    return remove_epoll_out(write_epoll_fd, connection);
+}
+
+bool append_event(ConnectionTable& table, int write_epoll_fd, ob::tcp::ConnectionState& connection,
+                  const ob::codec::EncodedOutbound& bytes) {
+    if (connection.closed.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // Drop bytes already written before checking the cap. This keeps long-lived
+    // connections from carrying dead buffer space.
+    if (connection.write_offset > 0) {
+        const std::size_t pending = connection.write_buf.size() - connection.write_offset;
+        std::memmove(connection.write_buf.data(),
+                     connection.write_buf.data() + connection.write_offset, pending);
+        connection.write_buf.resize(pending);
+        connection.write_offset = 0;
+    }
+
+    if (connection.write_buf.size() + bytes.size() > ob::config::WRITE_BUF_CAP_BYTES) {
+        std::fprintf(stderr, "closing slow client participant=%u\n", connection.participant_id);
+        close_client(table, write_epoll_fd, connection);
+        return true;
+    }
+
+    connection.write_buf.insert(connection.write_buf.end(), bytes.begin(), bytes.end());
+    return flush_client(table, write_epoll_fd, connection);
+}
+
+ob::tcp::ConnectionState* connection_for_write_fd(ConnectionTable& table, int fd) {
+    std::lock_guard lock{table.mutex};
+    const auto id = table.participant_by_fd.find(fd);
+    if (id == table.participant_by_fd.end()) {
+        return nullptr;
+    }
+    const auto connection = table.by_participant.find(id->second);
+    return connection == table.by_participant.end() ? nullptr : connection->second.get();
+}
+
+void close_drained_readers(ConnectionTable& table, int write_epoll_fd) {
+    for (;;) {
+        ob::tcp::ConnectionState* to_close = nullptr;
+        {
+            std::lock_guard lock{table.mutex};
+            for (auto& [_, connection] : table.by_participant) {
+                if (connection->read_closed.load(std::memory_order_acquire) &&
+                    connection->write_buf.empty() &&
+                    !connection->closed.load(std::memory_order_acquire)) {
+                    to_close = connection.get();
+                    break;
+                }
+            }
+        }
+
+        if (to_close == nullptr) {
+            return;
+        }
+        close_client(table, write_epoll_fd, *to_close);
     }
 }
 
-bool run_logger(OutboundRing& outbound, ConnectionTable& table, ob::WaitMode wait_mode) {
+bool flush_writable_clients(ConnectionTable& table, int write_epoll_fd) {
+    epoll_event events[kEpollEvents]{};
+    const int count = ::epoll_wait(write_epoll_fd, events, kEpollEvents, 1);
+    if (count < 0) {
+        if (errno == EINTR) {
+            return true;
+        }
+        std::perror("epoll_wait(EPOLLOUT)");
+        return false;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < count; ++i) {
+        ob::tcp::ConnectionState* connection = connection_for_write_fd(table, events[i].data.fd);
+        if (connection == nullptr) {
+            continue;
+        }
+        ok = flush_client(table, write_epoll_fd, *connection) && ok;
+    }
+    return ok;
+}
+
+void close_all_clients(ConnectionTable& table, int write_epoll_fd) {
+    std::vector<ob::tcp::ConnectionState*> connections;
+    {
+        std::lock_guard lock{table.mutex};
+        connections.reserve(table.by_participant.size());
+        for (auto& [_, connection] : table.by_participant) {
+            connections.push_back(connection.get());
+        }
+    }
+
+    for (ob::tcp::ConnectionState* connection : connections) {
+        close_client(table, write_epoll_fd, *connection);
+    }
+}
+
+bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
+    const int write_epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
+    if (write_epoll_fd < 0) {
+        std::perror("epoll_create1(EPOLLOUT)");
+        return false;
+    }
+
     ob::OutboundEvent event{};
     bool ok = true;
     for (;;) {
         if (!outbound.pop(event)) {
-            ob::matching_loop_wait(wait_mode);
+            ok = flush_writable_clients(table, write_epoll_fd) && ok;
+            close_drained_readers(table, write_epoll_fd);
             continue;
         }
 
         if (event.type == ob::EventType::StopEngine) {
-            close_all_clients(table);
+            close_drained_readers(table, write_epoll_fd);
+            close_all_clients(table, write_epoll_fd);
+            ::close(write_epoll_fd);
             return ok;
         }
 
-        const int fd = fd_for_participant(table, event.participant_id);
-        if (fd < 0) {
-            ok = false;
+        ob::tcp::ConnectionState* connection =
+            connection_for_participant(table, event.participant_id);
+        if (connection == nullptr) {
             continue;
         }
 
         const auto bytes = ob::codec::encode_outbound(event);
-        ok = write_all(fd, bytes, wait_mode) && ok;
+        ok = append_event(table, write_epoll_fd, *connection, bytes) && ok;
     }
 }
 
@@ -491,7 +639,7 @@ int run_server(const Options& options) {
     std::thread producer{[&] { producer_ok = run_producer(listen_fd, table, *inbound, options); }};
     std::thread matcher{[&] { matching_stats = loop->run_until_stop(options.wait_mode); }};
 
-    const bool logger_ok = run_logger(*outbound, table, options.wait_mode);
+    const bool logger_ok = run_logger(*outbound, table);
 
     producer.join();
     matcher.join();
