@@ -5,6 +5,7 @@
 // socket, runs the existing matcher pipeline, and sends fixed-size event records
 // back to the participant that owns each event.
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -43,12 +44,22 @@ using EngineLoop =
 constexpr std::uint16_t kDefaultPort = 9001;
 constexpr std::size_t kDefaultClientCount = 1;
 constexpr int kEpollEvents = 16;
+constexpr int kProducerPollMillis = 100;
+constexpr std::uint64_t kShutdownFlushNanos = 500'000'000;
+
+std::atomic_bool shutdown_requested{false};
 
 struct Options {
     std::uint16_t port{kDefaultPort};
     std::size_t clients{kDefaultClientCount};
     ob::WaitMode wait_mode{ob::WaitMode::Spin};
 };
+
+// The signal handler only records the request. Normal code does the actual
+// socket cleanup, ring push, and thread joins from safe places.
+void request_shutdown(int) noexcept {
+    shutdown_requested.store(true, std::memory_order_release);
+}
 
 // The table has two views of the same connections:
 //   fd -> participant_id for the producer read path
@@ -214,6 +225,11 @@ bool mark_read_closed(int epoll_fd, ConnectionTable& table, int fd) {
     return table.accepting_done && table.active_readers == 0;
 }
 
+bool all_readers_finished(ConnectionTable& table) {
+    std::lock_guard lock{table.mutex};
+    return table.accepting_done && table.active_readers == 0;
+}
+
 bool set_tcp_nodelay(int fd) {
     const int yes = 1;
     if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) != 0) {
@@ -374,7 +390,17 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
     bool ok = true;
     bool done = false;
     while (!done) {
-        const int count = ::epoll_wait(epoll_fd, events, kEpollEvents, -1);
+        if (shutdown_requested.load(std::memory_order_acquire)) {
+            stop_accepting(epoll_fd, listen_fd, table);
+            break;
+        }
+        if (all_readers_finished(table)) {
+            break;
+        }
+
+        // A finite timeout keeps Ctrl-C responsive even if no sockets are busy
+        // enough to wake epoll by themselves.
+        const int count = ::epoll_wait(epoll_fd, events, kEpollEvents, kProducerPollMillis);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -382,6 +408,9 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
             std::perror("epoll_wait");
             ok = false;
             break;
+        }
+        if (count == 0) {
+            continue;
         }
 
         for (int i = 0; i < count && !done; ++i) {
@@ -458,6 +487,10 @@ void close_client(ConnectionTable& table, int write_epoll_fd,
     }
 
     std::lock_guard lock{table.mutex};
+    if (!connection.read_closed.exchange(true, std::memory_order_acq_rel) &&
+        table.active_readers > 0) {
+        --table.active_readers;
+    }
     table.participant_by_fd.erase(fd);
 }
 
@@ -571,6 +604,29 @@ bool flush_writable_clients(ConnectionTable& table, int write_epoll_fd) {
     return ok;
 }
 
+bool has_pending_writes(ConnectionTable& table) {
+    std::lock_guard lock{table.mutex};
+    for (const auto& [_, connection] : table.by_participant) {
+        if (!connection->closed.load(std::memory_order_acquire) && !connection->write_buf.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool flush_before_shutdown(ConnectionTable& table, int write_epoll_fd) {
+    bool ok = true;
+    const std::uint64_t deadline = ob::engine_time_nanos() + kShutdownFlushNanos;
+
+    // StopEngine means no more events will arrive. Give already-buffered
+    // responses a short chance to leave before closing the client sockets.
+    while (has_pending_writes(table) && ob::engine_time_nanos() < deadline) {
+        ok = flush_writable_clients(table, write_epoll_fd) && ok;
+        close_drained_readers(table, write_epoll_fd);
+    }
+    return ok;
+}
+
 void close_all_clients(ConnectionTable& table, int write_epoll_fd) {
     std::vector<ob::tcp::ConnectionState*> connections;
     {
@@ -604,6 +660,7 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
 
         if (event.type == ob::EventType::StopEngine) {
             close_drained_readers(table, write_epoll_fd);
+            ok = flush_before_shutdown(table, write_epoll_fd) && ok;
             close_all_clients(table, write_epoll_fd);
             ::close(write_epoll_fd);
             return ok;
@@ -621,7 +678,9 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
 }
 
 int run_server(const Options& options) {
+    shutdown_requested.store(false, std::memory_order_release);
     ::signal(SIGPIPE, SIG_IGN);
+    ::signal(SIGINT, request_shutdown);
 
     const int listen_fd = make_listener(options.port);
     if (listen_fd < 0) {
