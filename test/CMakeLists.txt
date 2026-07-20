@@ -72,6 +72,10 @@ add_executable(threaded_differential_pipeline_test threaded_differential_pipelin
 target_link_libraries(threaded_differential_pipeline_test PRIVATE orderbook_core)
 add_test(NAME threaded_differential_pipeline_test COMMAND threaded_differential_pipeline_test)
 
+add_executable(tcp_pipeline_test tcp_pipeline_test.cpp)
+target_link_libraries(tcp_pipeline_test PRIVATE orderbook_codec)
+add_test(NAME tcp_pipeline_test COMMAND tcp_pipeline_test $<TARGET_FILE:tcp_server>)
+
 add_test(
   NAME deterministic_replay_test
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/deterministic_replay_test.sh
