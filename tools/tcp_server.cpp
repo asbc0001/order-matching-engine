@@ -419,6 +419,13 @@ bool read_client_commands(int epoll_fd, ConnectionTable& table, int fd, InboundR
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return true;
         }
+        if (errno == ECONNRESET || errno == EBADF) {
+            // A client can reset, or the logger can close a slow client while
+            // the producer still has a stale read event. Either way, treat it
+            // as that client's read side ending, not as a server failure.
+            all_clients_closed = mark_read_closed(epoll_fd, table, fd);
+            return true;
+        }
 
         std::perror("recv");
         all_clients_closed = mark_read_closed(epoll_fd, table, fd);
