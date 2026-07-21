@@ -108,3 +108,43 @@ build/debug/bench/engine_bench 100000 100000 123 --yield
 The output reports event counts, latency percentiles, wait counters, and late
 sends. Treat local/debug numbers as a functionality check; final benchmark
 numbers should come from a dedicated release run on suitable hardware.
+
+## tcp_server and client
+
+Runs the threaded engine behind local TCP sockets. Trading clients send text
+commands through `client`; the client encodes them into the fixed-size binary
+records expected by the server.
+
+Start the server:
+
+```bash
+build/debug/tools/tcp_server 9001 --clients 2 --yield
+```
+
+In another terminal, watch public L2 market-data updates:
+
+```bash
+build/debug/tools/client --spectator 127.0.0.1 9001
+```
+
+In a third terminal, send trading commands:
+
+```bash
+build/debug/tools/client 127.0.0.1 9001
+```
+
+Example trader input:
+
+```text
+LIMIT BID 100 10
+LIMIT ASK 105 4
+MARKET BID 2
+```
+
+Normal client mode prints private execution responses such as `AckNew`, `Fill`,
+or `Reject`. Spectator mode sends `SPECTATOR` once, then prints L2 text lines
+such as:
+
+```text
+L2 side=Bid price=100 qty=10
+```

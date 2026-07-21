@@ -4,6 +4,7 @@
 // encodes each line, sends it, then prints decoded responses until that command
 // gets its final RequestComplete event.
 
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -30,11 +31,12 @@ constexpr std::uint16_t kDefaultPort = 9001;
 struct Options {
     const char* host{kDefaultHost};
     std::uint16_t port{kDefaultPort};
+    bool spectator{false};
 };
 
 // The client is a small manual tool, so positional host/port are enough.
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s [host] [port]\n", program);
+    std::fprintf(stderr, "usage: %s [--spectator] [host] [port]\n", program);
     return 2;
 }
 
@@ -51,15 +53,26 @@ bool parse_port(std::string_view text, std::uint16_t& port) {
 
 bool parse_options(int argc, char** argv, Options& options) {
     if (argc > 3) {
+        if (argc != 4 || std::string_view{argv[1]} != "--spectator") {
+            return false;
+        }
+        options.spectator = true;
+        options.host = argv[2];
+        return parse_port(argv[3], options.port);
+    }
+
+    int next = 1;
+    if (argc >= 2 && std::string_view{argv[1]} == "--spectator") {
+        options.spectator = true;
+        next = 2;
+    }
+    if (argc > next) {
+        options.host = argv[next++];
+    }
+    if (argc > next && !parse_port(argv[next++], options.port)) {
         return false;
     }
-    if (argc >= 2) {
-        options.host = argv[1];
-    }
-    if (argc == 3 && !parse_port(argv[2], options.port)) {
-        return false;
-    }
-    return true;
+    return next == argc;
 }
 
 // Connect to the proof server. The server listens on IPv4 loopback only, so the
@@ -165,6 +178,44 @@ bool read_command_response(int fd) {
     }
 }
 
+// Spectators receive text market-data lines and do not send trading commands.
+int run_spectator(const Options& options) {
+    const int fd = connect_to_server(options);
+    if (fd < 0) {
+        return 1;
+    }
+
+    constexpr std::string_view handshake = "SPECTATOR\n";
+    if (!write_all(
+            fd, std::span<const std::uint8_t>{
+                    reinterpret_cast<const std::uint8_t*>(handshake.data()), handshake.size()})) {
+        ::close(fd);
+        return 1;
+    }
+
+    std::array<char, 512> buffer{};
+    for (;;) {
+        const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - 1, 0);
+        if (n > 0) {
+            buffer[static_cast<std::size_t>(n)] = '\0';
+            std::fputs(buffer.data(), stdout);
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        std::perror("recv");
+        ::close(fd);
+        return 1;
+    }
+
+    ::close(fd);
+    return 0;
+}
+
 bool is_blank(std::string_view line) {
     for (char ch : line) {
         if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
@@ -217,6 +268,9 @@ int main(int argc, char** argv) {
     Options options;
     if (!parse_options(argc, argv, options)) {
         return usage(argv[0]);
+    }
+    if (options.spectator) {
+        return run_spectator(options);
     }
     return run_client(options);
 }
