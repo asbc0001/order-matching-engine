@@ -18,6 +18,10 @@
 namespace ob::tcp {
 
 enum class ConnectionRole : std::uint8_t {
+    // A new socket has not declared its role yet. The first valid binary
+    // command makes it a trader; the SPECTATOR line makes it a market-data
+    // client.
+    Pending,
     Trader,
     Spectator,
 };
@@ -25,7 +29,8 @@ enum class ConnectionRole : std::uint8_t {
 struct ConnectionState {
     int fd{-1};
     ParticipantId participant_id{0};
-    ConnectionRole role{ConnectionRole::Trader};
+    ConnectionRole role{ConnectionRole::Pending};
+    std::uint64_t accepted_at_nanos{0};
 
     // Producer-owned buffer. It keeps partial fixed-size command records until
     // enough bytes have arrived for codec decoding.
@@ -37,6 +42,11 @@ struct ConnectionState {
     std::vector<std::uint8_t> write_buf{};
     std::size_t write_offset{0};
     bool write_registered{false};
+    bool spectator_handshake_possible{true};
+
+    // Bad binary records are a client error, not a server error. The server
+    // tracks them so it can close only the offending client.
+    std::size_t malformed_records{0};
 
     // Producer sets read_closed after EOF, a read error, or malformed input.
     // Logger observes it and closes the fd once any queued writes are flushed.
@@ -49,8 +59,11 @@ struct ConnectionState {
 
     ConnectionState() = default;
 
-    ConnectionState(int socket_fd, ParticipantId id)
-        : fd(socket_fd), participant_id(id), read_buf(config::READ_BUF_INITIAL_BYTES) {
+    ConnectionState(int socket_fd, ParticipantId id, std::uint64_t accepted_at)
+        : fd(socket_fd),
+          participant_id(id),
+          accepted_at_nanos(accepted_at),
+          read_buf(config::READ_BUF_INITIAL_BYTES) {
         write_buf.reserve(config::WRITE_BUF_CAP_BYTES);
     }
 };

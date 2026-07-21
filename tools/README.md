@@ -118,14 +118,14 @@ records expected by the server.
 Start the server:
 
 ```bash
-build/debug/tools/tcp_server 9001 --clients 2 --yield
+build/debug/tools/tcp_server 9001 --traders 1 --spectators 1 --yield
 ```
 
 By default the server listens only on `127.0.0.1`. To accept connections from
 other machines, bind explicitly:
 
 ```bash
-build/debug/tools/tcp_server 9001 --bind 0.0.0.0 --clients 2 --yield
+build/debug/tools/tcp_server 9001 --bind 0.0.0.0 --traders 1 --spectators 1 --yield
 ```
 
 Use external binding only on a trusted network. This development server has no
@@ -165,6 +165,8 @@ Protocol overview:
 
 - The server binds to `127.0.0.1` by default and assigns a new participant id to
   each accepted trading connection.
+- `--traders` and `--spectators` cap each client role separately. `--clients`
+  remains a shorthand for trader-only local runs.
 - Trading clients send fixed-size binary command records; `client` hides that
   by parsing the text grammar above and encoding each command.
 - Trading clients receive fixed-size binary event records, decoded by `client`
@@ -175,5 +177,9 @@ Protocol overview:
   do not submit orders.
 - Malformed binary commands close that client connection. Valid rejected orders
   stay connected and return a `Reject` event.
+- Clients that connect but never send a command or spectator handshake are
+  closed after a short timeout.
+- Client read buffers are capped, and each readable socket is handled in a
+  bounded batch before the server returns to other clients.
 - Slow readers are disconnected once their pending response buffer exceeds the
   configured cap, so one client cannot block the server.

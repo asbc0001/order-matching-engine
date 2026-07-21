@@ -32,6 +32,8 @@ constexpr std::uint16_t kFragmentPort = 19101;
 constexpr std::uint16_t kSlowClientPort = 19102;
 constexpr std::uint16_t kSpectatorPort = 19103;
 constexpr std::uint16_t kSnapshotPort = 19104;
+constexpr std::uint16_t kMalformedPort = 19105;
+constexpr std::uint16_t kPendingTimeoutPort = 19106;
 
 struct ServerProcess {
     pid_t pid{-1};
@@ -104,14 +106,16 @@ bool recv_all(int fd, std::uint8_t* data, std::size_t size) {
 }
 
 ServerProcess start_server(std::string_view server_path, std::uint16_t port,
-                           std::size_t clients = 1) {
+                           std::size_t traders = 1, std::size_t spectators = 0) {
     ServerProcess server;
     server.pid = ::fork();
     if (server.pid == 0) {
         const std::string port_text = std::to_string(port);
-        const std::string clients_text = std::to_string(clients);
-        ::execl(server_path.data(), server_path.data(), port_text.c_str(), "--clients",
-                clients_text.c_str(), "--yield", static_cast<char*>(nullptr));
+        const std::string traders_text = std::to_string(traders);
+        const std::string spectators_text = std::to_string(spectators);
+        ::execl(server_path.data(), server_path.data(), port_text.c_str(), "--traders",
+                traders_text.c_str(), "--spectators", spectators_text.c_str(), "--yield",
+                static_cast<char*>(nullptr));
         std::_Exit(127);
     }
     return server;
@@ -322,7 +326,7 @@ bool slow_client_is_disconnected(std::string_view server_path) {
 bool spectator_receives_l2_updates(std::string_view server_path) {
     // Three clients: one market-data spectator, one resting trader, and one
     // crossing trader so the fill is not blocked by self-trade prevention.
-    auto server = start_server(server_path, kSpectatorPort, 3);
+    auto server = start_server(server_path, kSpectatorPort, 2, 1);
     const int spectator_fd = connect_with_retry(kSpectatorPort);
     if (spectator_fd < 0) {
         std::fprintf(stderr, "could not connect spectator\n");
@@ -446,7 +450,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
 }
 
 bool spectator_receives_existing_depth_snapshot(std::string_view server_path) {
-    auto server = start_server(server_path, kSnapshotPort, 2);
+    auto server = start_server(server_path, kSnapshotPort, 1, 1);
     const int trader_fd = connect_with_retry(kSnapshotPort);
     if (trader_fd < 0) {
         std::fprintf(stderr, "could not connect snapshot trader\n");
@@ -500,6 +504,71 @@ bool spectator_receives_existing_depth_snapshot(std::string_view server_path) {
     return true;
 }
 
+bool malformed_record_closes_only_that_client(std::string_view server_path) {
+    auto server = start_server(server_path, kMalformedPort, 1);
+    const int fd = connect_with_retry(kMalformedPort);
+    if (fd < 0) {
+        std::fprintf(stderr, "could not connect malformed-record client\n");
+        return false;
+    }
+
+    timeval receive_timeout{
+        .tv_sec = 2,
+        .tv_usec = 0,
+    };
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+
+    std::array<std::uint8_t, ob::codec::ENCODED_INBOUND_SIZE> bad_record{};
+    if (!send_all(fd, bad_record.data(), bad_record.size())) {
+        std::fprintf(stderr, "could not send malformed record\n");
+        ::close(fd);
+        return false;
+    }
+
+    std::array<std::uint8_t, 1> byte{};
+    const ssize_t n = ::recv(fd, byte.data(), byte.size(), 0);
+    const bool closed = n == 0 || (n < 0 && errno == ECONNRESET);
+    ::close(fd);
+    if (!closed) {
+        std::fprintf(stderr, "malformed-record client was not closed\n");
+        return false;
+    }
+    if (!server.wait_for_exit()) {
+        std::fprintf(stderr, "malformed-record server did not exit cleanly\n");
+        return false;
+    }
+    return true;
+}
+
+bool idle_pending_client_is_closed(std::string_view server_path) {
+    auto server = start_server(server_path, kPendingTimeoutPort, 1);
+    const int fd = connect_with_retry(kPendingTimeoutPort);
+    if (fd < 0) {
+        std::fprintf(stderr, "could not connect idle pending client\n");
+        return false;
+    }
+
+    timeval receive_timeout{
+        .tv_sec = 3,
+        .tv_usec = 0,
+    };
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+
+    std::array<std::uint8_t, 1> byte{};
+    const ssize_t n = ::recv(fd, byte.data(), byte.size(), 0);
+    const bool closed = n == 0 || (n < 0 && errno == ECONNRESET);
+    ::close(fd);
+    if (!closed) {
+        std::fprintf(stderr, "idle pending client was not closed\n");
+        return false;
+    }
+    if (!server.wait_for_exit()) {
+        std::fprintf(stderr, "pending-timeout server did not exit cleanly\n");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -518,6 +587,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!spectator_receives_existing_depth_snapshot(argv[1])) {
+        return 1;
+    }
+    if (!malformed_record_closes_only_that_client(argv[1])) {
+        return 1;
+    }
+    if (!idle_pending_client_is_closed(argv[1])) {
         return 1;
     }
 

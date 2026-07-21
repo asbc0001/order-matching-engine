@@ -43,6 +43,7 @@ inline constexpr Price BASE_PRICE = 0;  // Placeholder; real deployments should
 // explicit.
 inline constexpr std::size_t MAX_CLIENTS = 64;
 inline constexpr std::size_t READ_BUF_INITIAL_BYTES = 4'096;
+inline constexpr std::size_t READ_BUF_CAP_BYTES = 64 * 1'024;
 inline constexpr std::size_t WRITE_BUF_CAP_BYTES = 256 * 1'024;
 
 }  // namespace ob::config

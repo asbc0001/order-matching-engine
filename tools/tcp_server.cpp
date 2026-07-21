@@ -5,6 +5,7 @@
 // socket, runs the existing matcher pipeline, and sends fixed-size event records
 // back to the participant that owns each event.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -47,8 +48,15 @@ using EngineLoop =
 constexpr std::uint16_t kDefaultPort = 9001;
 constexpr std::size_t kDefaultClientCount = 1;
 constexpr int kEpollEvents = 16;
+constexpr int kListenBacklog = 16;
 constexpr int kProducerPollMillis = 100;
 constexpr std::uint64_t kShutdownFlushNanos = 500'000'000;
+constexpr std::uint64_t kPendingClientTimeoutNanos = 1'000'000'000;
+
+// Keep each readable socket to a small batch before returning to epoll, so one
+// busy client does not dominate the producer thread.
+constexpr std::size_t kMaxCommandsPerRead = 64;
+constexpr std::size_t kMaxMalformedRecords = 1;
 constexpr std::string_view kSpectatorHandshake = "SPECTATOR\n";
 
 std::atomic_bool shutdown_requested{false};
@@ -56,7 +64,8 @@ std::atomic_bool shutdown_requested{false};
 struct Options {
     const char* bind_address{"127.0.0.1"};
     std::uint16_t port{kDefaultPort};
-    std::size_t clients{kDefaultClientCount};
+    std::size_t max_traders{kDefaultClientCount};
+    std::size_t max_spectators{0};
     ob::WaitMode wait_mode{ob::WaitMode::Spin};
 };
 
@@ -74,12 +83,22 @@ struct ConnectionTable {
     std::unordered_map<int, ob::ParticipantId> participant_by_fd;
     std::unordered_map<ob::ParticipantId, std::unique_ptr<ob::tcp::ConnectionState>> by_participant;
     std::size_t accepted{0};
+    std::size_t traders{0};
+    std::size_t spectators{0};
+
+    // Caps are stored with the table because the connection's role is only
+    // known after it sends either a binary command or the spectator handshake.
+    std::size_t max_traders{0};
+    std::size_t max_spectators{0};
     std::size_t active_readers{0};
     bool accepting_done{false};
 };
 
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s [port] [--bind IPv4] [--clients N] [--yield]\n", program);
+    std::fprintf(stderr,
+                 "usage: %s [port] [--bind IPv4] [--clients N] [--traders N] "
+                 "[--spectators N] [--yield]\n",
+                 program);
     return 2;
 }
 
@@ -95,11 +114,11 @@ bool parse_u16(std::string_view text, std::uint16_t& value) {
     return true;
 }
 
-// Parse a positive count used for options like --clients.
+// Parse a count used for client-role caps.
 bool parse_size(std::string_view text, std::size_t& value) {
     unsigned long long parsed = 0;
     char tail = '\0';
-    if (std::sscanf(std::string{text}.c_str(), "%llu%c", &parsed, &tail) != 1 || parsed == 0) {
+    if (std::sscanf(std::string{text}.c_str(), "%llu%c", &parsed, &tail) != 1) {
         return false;
     }
     value = static_cast<std::size_t>(parsed);
@@ -107,7 +126,7 @@ bool parse_size(std::string_view text, std::size_t& value) {
 }
 
 // Keep the tool deliberately small: one optional port, an optional bind
-// address, a client count, and a local-friendly wait mode.
+// address, role caps, and a local-friendly wait mode.
 bool parse_options(int argc, char** argv, Options& options) {
     bool saw_port = false;
     for (int i = 1; i < argc; ++i) {
@@ -124,8 +143,23 @@ bool parse_options(int argc, char** argv, Options& options) {
             continue;
         }
         if (arg == "--clients") {
-            if (i + 1 >= argc || !parse_size(argv[++i], options.clients) ||
-                options.clients > ob::config::MAX_CLIENTS) {
+            std::size_t clients = 0;
+            if (i + 1 >= argc || !parse_size(argv[++i], clients) ||
+                clients > ob::config::MAX_CLIENTS) {
+                return false;
+            }
+            options.max_traders = clients;
+            options.max_spectators = 0;
+            continue;
+        }
+        if (arg == "--traders") {
+            if (i + 1 >= argc || !parse_size(argv[++i], options.max_traders)) {
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--spectators") {
+            if (i + 1 >= argc || !parse_size(argv[++i], options.max_spectators)) {
                 return false;
             }
             continue;
@@ -135,7 +169,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         saw_port = true;
     }
-    return true;
+    return options.max_traders + options.max_spectators > 0 &&
+           options.max_traders + options.max_spectators <= ob::config::MAX_CLIENTS;
 }
 
 // Create the listening socket. Binding defaults to 127.0.0.1; external access
@@ -167,7 +202,7 @@ int make_listener(const char* bind_address, std::uint16_t port) {
         ::close(fd);
         return -1;
     }
-    if (::listen(fd, 16) != 0) {
+    if (::listen(fd, kListenBacklog) != 0) {
         std::perror("listen");
         ::close(fd);
         return -1;
@@ -248,13 +283,32 @@ bool mark_read_closed(int epoll_fd, ConnectionTable& table, int fd) {
     return table.accepting_done && table.active_readers == 0;
 }
 
+bool mark_trader(ConnectionTable& table, ob::tcp::ConnectionState& connection) {
+    std::lock_guard lock{table.mutex};
+    if (connection.role == ob::tcp::ConnectionRole::Trader) {
+        return true;
+    }
+    if (connection.role != ob::tcp::ConnectionRole::Pending || table.traders >= table.max_traders) {
+        return false;
+    }
+    connection.role = ob::tcp::ConnectionRole::Trader;
+    connection.spectator_handshake_possible = false;
+    ++table.traders;
+    return true;
+}
+
 // A spectator reads market data only. After the handshake, the producer stops
 // watching it for input but leaves the fd known so the logger can write to it.
 bool mark_spectator(int epoll_fd, ConnectionTable& table, ob::tcp::ConnectionState& connection) {
     (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection.fd, nullptr);
 
     std::lock_guard lock{table.mutex};
+    if (connection.role != ob::tcp::ConnectionRole::Pending ||
+        table.spectators >= table.max_spectators) {
+        return false;
+    }
     connection.role = ob::tcp::ConnectionRole::Spectator;
+    ++table.spectators;
     connection.read_size = 0;
     connection.snapshot_pending.store(true, std::memory_order_release);
     if (!connection.read_closed.exchange(true, std::memory_order_acq_rel) &&
@@ -272,6 +326,34 @@ bool all_readers_finished(ConnectionTable& table) {
     return table.accepting_done && table.active_readers == 0;
 }
 
+// Pending clients have not sent a valid command or SPECTATOR line yet. Close
+// them after a short timeout so they cannot occupy a role slot forever.
+bool close_timed_out_pending_clients(int epoll_fd, ConnectionTable& table) {
+    std::vector<int> timed_out_fds;
+    const std::uint64_t now = ob::engine_time_nanos();
+    {
+        std::lock_guard lock{table.mutex};
+        for (const auto& [fd, participant_id] : table.participant_by_fd) {
+            const auto found = table.by_participant.find(participant_id);
+            if (found == table.by_participant.end()) {
+                continue;
+            }
+            const auto& connection = *found->second;
+            if (connection.role == ob::tcp::ConnectionRole::Pending &&
+                now - connection.accepted_at_nanos >= kPendingClientTimeoutNanos) {
+                timed_out_fds.push_back(fd);
+            }
+        }
+    }
+
+    bool finished = false;
+    for (int fd : timed_out_fds) {
+        std::fprintf(stderr, "pending client timed out\n");
+        finished = mark_read_closed(epoll_fd, table, fd);
+    }
+    return finished;
+}
+
 // Disable Nagle's algorithm so small responses are sent promptly during local
 // interactive runs.
 bool set_tcp_nodelay(int fd) {
@@ -285,7 +367,8 @@ bool set_tcp_nodelay(int fd) {
 
 // Store a newly accepted socket in both routing maps.
 bool add_client(ConnectionTable& table, int client_fd, ob::ParticipantId participant_id) {
-    auto connection = std::make_unique<ob::tcp::ConnectionState>(client_fd, participant_id);
+    auto connection = std::make_unique<ob::tcp::ConnectionState>(client_fd, participant_id,
+                                                                 ob::engine_time_nanos());
 
     std::lock_guard lock{table.mutex};
     table.participant_by_fd[client_fd] = participant_id;
@@ -305,7 +388,8 @@ void stop_accepting(int epoll_fd, int listen_fd, ConnectionTable& table) {
 // Accept every queued client until the kernel says there are no more ready.
 // Participant ids are assigned by the server, never by fd or client input.
 bool accept_ready_clients(int listen_fd, int epoll_fd, ConnectionTable& table,
-                          ob::tcp::ParticipantIdSource& ids, std::size_t target_clients) {
+                          ob::tcp::ParticipantIdSource& ids) {
+    const std::size_t target_clients = table.max_traders + table.max_spectators;
     for (;;) {
         if (table.accepted >= target_clients) {
             stop_accepting(epoll_fd, listen_fd, table);
@@ -348,17 +432,23 @@ bool accept_ready_clients(int listen_fd, int epoll_fd, ConnectionTable& table,
 // stay at the front of read_buf for the next recv(), which handles fragmented
 // TCP input naturally.
 bool decode_buffered_commands(ob::tcp::ConnectionState& connection, InboundRing& inbound,
-                              ob::WaitMode wait_mode) {
+                              ConnectionTable& table, ob::WaitMode wait_mode) {
     constexpr std::size_t record_size = ob::codec::ENCODED_INBOUND_SIZE;
     std::size_t offset = 0;
+    std::size_t decoded_records = 0;
 
-    while (connection.read_size - offset >= record_size) {
+    while (connection.read_size - offset >= record_size && decoded_records < kMaxCommandsPerRead) {
         const std::span<const std::uint8_t> record{connection.read_buf.data() + offset,
                                                    record_size};
         auto decoded = ob::codec::decode_inbound(record);
         if (!decoded) {
             std::fprintf(stderr, "bad inbound record: %s\n",
                          ob::codec::decode_error_name(decoded.error));
+            ++connection.malformed_records;
+            return connection.malformed_records < kMaxMalformedRecords;
+        }
+        if (!mark_trader(table, connection)) {
+            std::fprintf(stderr, "trader limit reached\n");
             return false;
         }
 
@@ -368,6 +458,7 @@ bool decode_buffered_commands(ob::tcp::ConnectionState& connection, InboundRing&
         msg.tsc_intended = ob::engine_time_nanos();
         push_command(inbound, msg, wait_mode);
         offset += record_size;
+        ++decoded_records;
     }
 
     if (offset > 0) {
@@ -378,23 +469,33 @@ bool decode_buffered_commands(ob::tcp::ConnectionState& connection, InboundRing&
     return true;
 }
 
-// Detect the optional read-only client handshake. Anything else falls through
-// to normal binary command decoding.
+// Detect the optional read-only client handshake. Once the buffered bytes no
+// longer match "SPECTATOR\n", this connection is treated as binary input only.
 bool try_read_spectator_handshake(int epoll_fd, ConnectionTable& table,
                                   ob::tcp::ConnectionState& connection, bool& all_clients_closed) {
+    if (!connection.spectator_handshake_possible) {
+        return false;
+    }
     if (connection.read_size > kSpectatorHandshake.size()) {
+        connection.spectator_handshake_possible = false;
         return false;
     }
     const std::string_view buffered{reinterpret_cast<const char*>(connection.read_buf.data()),
                                     connection.read_size};
     if (kSpectatorHandshake.substr(0, buffered.size()) != buffered) {
+        connection.spectator_handshake_possible = false;
         return false;
     }
     if (buffered.size() != kSpectatorHandshake.size()) {
         return true;
     }
 
-    all_clients_closed = mark_spectator(epoll_fd, table, connection);
+    if (!mark_spectator(epoll_fd, table, connection)) {
+        std::fprintf(stderr, "spectator limit reached\n");
+        all_clients_closed = mark_read_closed(epoll_fd, table, connection.fd);
+        return true;
+    }
+    all_clients_closed = all_readers_finished(table);
     return true;
 }
 
@@ -409,19 +510,34 @@ bool read_client_commands(int epoll_fd, ConnectionTable& table, int fd, InboundR
 
     for (;;) {
         if (connection->read_size == connection->read_buf.size()) {
-            connection->read_buf.resize(connection->read_buf.size() * 2);
+            if (connection->read_buf.size() >= ob::config::READ_BUF_CAP_BYTES) {
+                std::fprintf(stderr, "read buffer cap reached\n");
+                all_clients_closed = mark_read_closed(epoll_fd, table, fd);
+                return true;
+            }
+            connection->read_buf.resize(
+                std::min(connection->read_buf.size() * 2, ob::config::READ_BUF_CAP_BYTES));
         }
 
-        const ssize_t n = ::recv(fd, connection->read_buf.data() + connection->read_size,
-                                 connection->read_buf.size() - connection->read_size, 0);
+        // Bound the amount read from this socket in one producer pass. If more
+        // bytes remain in the kernel, level-triggered epoll will report the fd
+        // as readable again.
+        const std::size_t max_read =
+            std::min(connection->read_buf.size() - connection->read_size,
+                     kMaxCommandsPerRead * ob::codec::ENCODED_INBOUND_SIZE);
+        const ssize_t n =
+            ::recv(fd, connection->read_buf.data() + connection->read_size, max_read, 0);
         if (n > 0) {
             connection->read_size += static_cast<std::size_t>(n);
             if (try_read_spectator_handshake(epoll_fd, table, *connection, all_clients_closed)) {
                 return true;
             }
-            if (!decode_buffered_commands(*connection, inbound, wait_mode)) {
+            if (!decode_buffered_commands(*connection, inbound, table, wait_mode)) {
                 all_clients_closed = mark_read_closed(epoll_fd, table, fd);
-                return false;
+                return true;
+            }
+            if (static_cast<std::size_t>(n) == max_read) {
+                return true;
             }
             continue;
         }
@@ -470,6 +586,9 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
             stop_accepting(epoll_fd, listen_fd, table);
             break;
         }
+        if (close_timed_out_pending_clients(epoll_fd, table)) {
+            break;
+        }
         if (all_readers_finished(table)) {
             break;
         }
@@ -491,7 +610,7 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
 
         for (int i = 0; i < count && !done; ++i) {
             if (events[i].data.fd == listen_fd) {
-                ok = accept_ready_clients(listen_fd, epoll_fd, table, ids, options.clients);
+                ok = accept_ready_clients(listen_fd, epoll_fd, table, ids);
                 if (!ok) {
                     done = true;
                 }
@@ -923,13 +1042,18 @@ int run_server(const Options& options) {
     if (listen_fd < 0) {
         return 1;
     }
-    std::printf("listening on %s:%u for %zu client(s)\n", options.bind_address, options.port,
-                options.clients);
+    std::printf("listening on %s:%u for %zu trader(s) and %zu spectator(s)\n", options.bind_address,
+                options.port, options.max_traders, options.max_spectators);
+    std::printf("limits: read_buf_cap=%zu write_buf_cap=%zu commands_per_read=%zu\n",
+                ob::config::READ_BUF_CAP_BYTES, ob::config::WRITE_BUF_CAP_BYTES,
+                kMaxCommandsPerRead);
 
     auto inbound = std::make_unique<InboundRing>();
     auto outbound = std::make_unique<OutboundRing>();
     auto loop = std::make_unique<EngineLoop>(*inbound, *outbound);
     ConnectionTable table;
+    table.max_traders = options.max_traders;
+    table.max_spectators = options.max_spectators;
     ob::MatchingLoopStats matching_stats{};
     bool producer_ok = false;
 
