@@ -242,7 +242,7 @@ bool read_snapshot_containing(int fd, std::string_view expected_level) {
         }
         buffer[static_cast<std::size_t>(n)] = '\0';
         collected.append(buffer.data(), static_cast<std::size_t>(n));
-        if (collected.find("SNAPSHOT_END\n") != std::string::npos) {
+        if (collected.find("SNAPSHOT_END seq=") != std::string::npos) {
             return collected.find(expected_level) != std::string::npos;
         }
     }
@@ -342,7 +342,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     };
     (void)::setsockopt(spectator_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                        sizeof(receive_timeout));
-    if (!read_until_contains(spectator_fd, "SNAPSHOT_END\n")) {
+    if (!read_until_contains(spectator_fd, "SNAPSHOT_END seq=0\n")) {
         std::fprintf(stderr, "spectator did not receive initial snapshot\n");
         ::close(spectator_fd);
         return false;
@@ -366,7 +366,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
 
     ob::OutboundEvent bid_ack{};
     if (!read_event(trader_fd, bid_ack) || bid_ack.type != ob::EventType::AckNew ||
-        !read_until_contains(spectator_fd, "L2 side=Bid price=100 qty=1\n")) {
+        !read_until_contains(spectator_fd, "L2 seq=1 side=Bid price=100 qty=1\n")) {
         std::fprintf(stderr, "spectator did not receive resting-bid L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -381,7 +381,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     }
     ob::OutboundEvent cancel_ack{};
     if (!read_event(trader_fd, cancel_ack) || cancel_ack.type != ob::EventType::AckCancel ||
-        !read_until_contains(spectator_fd, "L2 side=Bid price=100 qty=0\n")) {
+        !read_until_contains(spectator_fd, "L2 seq=2 side=Bid price=100 qty=0\n")) {
         std::fprintf(stderr, "spectator did not receive cancel L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -396,7 +396,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     }
     ob::OutboundEvent ask_ack{};
     if (!read_event(trader_fd, ask_ack) || ask_ack.type != ob::EventType::AckNew ||
-        !read_until_contains(spectator_fd, "L2 side=Ask price=105 qty=5\n")) {
+        !read_until_contains(spectator_fd, "L2 seq=3 side=Ask price=105 qty=5\n")) {
         std::fprintf(stderr, "spectator did not receive resting-ask L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -426,7 +426,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     ob::OutboundEvent aggressor_fill{};
     if (!read_event(trader_fd, resting_fill) || !read_event(buyer_fd, aggressor_fill) ||
         resting_fill.type != ob::EventType::Fill || aggressor_fill.type != ob::EventType::Fill ||
-        !read_until_contains(spectator_fd, "L2 side=Ask price=105 qty=3\n")) {
+        !read_until_contains(spectator_fd, "L2 seq=4 side=Ask price=105 qty=3\n")) {
         std::fprintf(stderr, "spectator did not receive fill L2 update\n");
         ::close(buyer_fd);
         ::close(trader_fd);
@@ -484,7 +484,7 @@ bool spectator_receives_existing_depth_snapshot(std::string_view server_path) {
     constexpr std::string_view handshake = "SPECTATOR\n";
     if (!send_all(spectator_fd, reinterpret_cast<const std::uint8_t*>(handshake.data()),
                   handshake.size()) ||
-        !read_snapshot_containing(spectator_fd, "SNAPSHOT side=Ask price=106 qty=9\n")) {
+        !read_snapshot_containing(spectator_fd, "SNAPSHOT seq=1 side=Ask price=106 qty=9\n")) {
         std::fprintf(stderr, "spectator did not receive existing-depth snapshot\n");
         ::close(spectator_fd);
         ::close(trader_fd);

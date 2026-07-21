@@ -156,9 +156,9 @@ or `Reject`. Spectator mode sends `SPECTATOR` once, prints the current L2
 snapshot, then prints live L2 update lines such as:
 
 ```text
-SNAPSHOT_BEGIN
-SNAPSHOT_END
-L2 side=Bid price=100 qty=10
+SNAPSHOT_BEGIN seq=0
+SNAPSHOT_END seq=0
+L2 seq=1 side=Bid price=100 qty=10
 ```
 
 Protocol overview:
@@ -170,7 +170,9 @@ Protocol overview:
 - Trading clients receive fixed-size binary event records, decoded by `client`
   into readable `AckNew`, `Fill`, `Reject`, and `AckCancel` lines.
 - Spectator clients send `SPECTATOR` as their first line, then receive a text
-  L2 snapshot followed by live text updates. They do not submit orders.
+  L2 snapshot followed by live text updates. Each snapshot and update carries
+  an L2 sequence number so a client can detect missed update lines. Spectators
+  do not submit orders.
 - Malformed binary commands close that client connection. Valid rejected orders
   stay connected and return a `Reject` event.
 - Slow readers are disconnected once their pending response buffer exceeds the

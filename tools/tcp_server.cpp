@@ -649,10 +649,11 @@ bool append_text(ConnectionTable& table, int write_epoll_fd, ob::tcp::Connection
 // Market-data clients receive simple text lines for now. The line reports the
 // new total quantity at the price level changed by this event.
 bool broadcast_l2_line(ConnectionTable& table, int write_epoll_fd, const ob::OutboundEvent& event,
-                       const ob::L2Book& l2_book) {
+                       const ob::L2Book& l2_book, std::uint64_t l2_sequence) {
     std::array<char, 96> line{};
     const int written = std::snprintf(
-        line.data(), line.size(), "L2 side=%s price=%lld qty=%llu\n", ob::side_name(event.side),
+        line.data(), line.size(), "L2 seq=%llu side=%s price=%lld qty=%llu\n",
+        static_cast<unsigned long long>(l2_sequence), ob::side_name(event.side),
         static_cast<long long>(event.price),
         static_cast<unsigned long long>(l2_book.quantity_at(event.side, event.price)));
     if (written <= 0 || static_cast<std::size_t>(written) >= line.size()) {
@@ -682,12 +683,13 @@ bool broadcast_l2_line(ConnectionTable& table, int write_epoll_fd, const ob::Out
 // Write the current visible depth for one side of the book.
 bool append_snapshot_side(ConnectionTable& table, int write_epoll_fd,
                           ob::tcp::ConnectionState& spectator, const ob::L2Book& l2_book,
-                          ob::Side side) {
+                          ob::Side side, std::uint64_t l2_sequence) {
     bool ok = true;
     for (const ob::L2Level& level : l2_book.levels(side)) {
         std::array<char, 96> line{};
         const int written = std::snprintf(
-            line.data(), line.size(), "SNAPSHOT side=%s price=%lld qty=%llu\n", ob::side_name(side),
+            line.data(), line.size(), "SNAPSHOT seq=%llu side=%s price=%lld qty=%llu\n",
+            static_cast<unsigned long long>(l2_sequence), ob::side_name(side),
             static_cast<long long>(level.price), static_cast<unsigned long long>(level.qty));
         if (written <= 0 || static_cast<std::size_t>(written) >= line.size()) {
             return false;
@@ -701,17 +703,40 @@ bool append_snapshot_side(ConnectionTable& table, int write_epoll_fd,
 
 // Send a complete text snapshot to a newly subscribed spectator.
 bool append_l2_snapshot(ConnectionTable& table, int write_epoll_fd,
-                        ob::tcp::ConnectionState& spectator, const ob::L2Book& l2_book) {
-    bool ok = append_text(table, write_epoll_fd, spectator, "SNAPSHOT_BEGIN\n");
-    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Bid) && ok;
-    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Ask) && ok;
-    ok = append_text(table, write_epoll_fd, spectator, "SNAPSHOT_END\n") && ok;
+                        ob::tcp::ConnectionState& spectator, const ob::L2Book& l2_book,
+                        std::uint64_t l2_sequence) {
+    std::array<char, 64> begin{};
+    int written = std::snprintf(begin.data(), begin.size(), "SNAPSHOT_BEGIN seq=%llu\n",
+                                static_cast<unsigned long long>(l2_sequence));
+    if (written <= 0 || static_cast<std::size_t>(written) >= begin.size()) {
+        return false;
+    }
+
+    bool ok = append_text(table, write_epoll_fd, spectator,
+                          std::string_view{begin.data(), static_cast<std::size_t>(written)});
+    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Bid,
+                              l2_sequence) &&
+         ok;
+    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Ask,
+                              l2_sequence) &&
+         ok;
+
+    std::array<char, 64> end{};
+    written = std::snprintf(end.data(), end.size(), "SNAPSHOT_END seq=%llu\n",
+                            static_cast<unsigned long long>(l2_sequence));
+    if (written <= 0 || static_cast<std::size_t>(written) >= end.size()) {
+        return false;
+    }
+    ok = append_text(table, write_epoll_fd, spectator,
+                     std::string_view{end.data(), static_cast<std::size_t>(written)}) &&
+         ok;
     return ok;
 }
 
 // New spectators are marked by the producer, but only the logger has the L2
 // state and write ownership, so it sends snapshots from here.
-bool send_pending_snapshots(ConnectionTable& table, int write_epoll_fd, const ob::L2Book& l2_book) {
+bool send_pending_snapshots(ConnectionTable& table, int write_epoll_fd, const ob::L2Book& l2_book,
+                            std::uint64_t l2_sequence) {
     std::vector<ob::tcp::ConnectionState*> spectators;
     {
         std::lock_guard lock{table.mutex};
@@ -726,7 +751,7 @@ bool send_pending_snapshots(ConnectionTable& table, int write_epoll_fd, const ob
 
     bool ok = true;
     for (ob::tcp::ConnectionState* spectator : spectators) {
-        ok = append_l2_snapshot(table, write_epoll_fd, *spectator, l2_book) && ok;
+        ok = append_l2_snapshot(table, write_epoll_fd, *spectator, l2_book, l2_sequence) && ok;
     }
     return ok;
 }
@@ -849,14 +874,19 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
 
     ob::OutboundEvent event{};
     ob::L2Book l2_book;
+    std::uint64_t l2_sequence = 0;
     bool ok = true;
     for (;;) {
         if (!outbound.pop(event)) {
-            ok = send_pending_snapshots(table, write_epoll_fd, l2_book) && ok;
+            ok = send_pending_snapshots(table, write_epoll_fd, l2_book, l2_sequence) && ok;
             ok = flush_writable_clients(table, write_epoll_fd) && ok;
             close_drained_readers(table, write_epoll_fd);
             continue;
         }
+
+        // A snapshot uses the last completed L2 sequence. Sending pending
+        // snapshots before this event avoids including this change twice.
+        ok = send_pending_snapshots(table, write_epoll_fd, l2_book, l2_sequence) && ok;
 
         if (event.type == ob::EventType::StopEngine) {
             close_drained_readers(table, write_epoll_fd);
@@ -869,8 +899,8 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
         const bool publish_l2 = changes_l2(event);
         if (publish_l2) {
             l2_book.apply(event);
-            ok = send_pending_snapshots(table, write_epoll_fd, l2_book) && ok;
-            ok = broadcast_l2_line(table, write_epoll_fd, event, l2_book) && ok;
+            ++l2_sequence;
+            ok = broadcast_l2_line(table, write_epoll_fd, event, l2_book, l2_sequence) && ok;
         }
 
         ob::tcp::ConnectionState* connection =
