@@ -1,10 +1,11 @@
 // client.cpp - Tiny text client for the TCP proof server.
 //
-// Lines typed on stdin use the same grammar as saved command files. The client
-// encodes each line, sends it, then prints decoded responses until that command
-// gets its final RequestComplete event.
+// Lines typed on stdin use the same grammar as saved command files. In trader
+// mode, one thread sends commands while another prints server responses as they
+// arrive. In spectator mode, the client only prints L2 market-data lines.
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -100,7 +102,7 @@ int connect_to_server(const Options& options) {
     return fd;
 }
 
-// Write the whole fixed-size command record before moving on to the response.
+// Write the whole fixed-size command record before accepting the next command.
 bool write_all(int fd, std::span<const std::uint8_t> bytes) {
     std::size_t written = 0;
     while (written < bytes.size()) {
@@ -153,27 +155,25 @@ bool print_event(const ob::OutboundEvent& event) {
                ob::reject_reason_name(event.reason), complete) >= 0;
 }
 
-// One input command can produce several events. RequestComplete marks the final
-// event for that command, so the client knows when to read the next line.
-bool read_command_response(int fd) {
+// Trading responses can arrive at any time, including fills for old resting
+// orders. Keep this reader running while the main thread accepts stdin.
+void read_trading_events(int fd, std::atomic_bool& ok) {
     for (;;) {
         ob::codec::EncodedOutbound bytes{};
         if (!read_exact(fd, bytes)) {
-            std::fprintf(stderr, "server closed before command completed\n");
-            return false;
+            return;
         }
 
         auto decoded = ob::codec::decode_outbound(bytes);
         if (!decoded) {
             std::fprintf(stderr, "bad outbound record: %s\n",
                          ob::codec::decode_error_name(decoded.error));
-            return false;
+            ok.store(false, std::memory_order_release);
+            return;
         }
         if (!print_event(decoded.value)) {
-            return false;
-        }
-        if ((decoded.value.flags & ob::RequestComplete) != 0) {
-            return true;
+            ok.store(false, std::memory_order_release);
+            return;
         }
     }
 }
@@ -231,6 +231,9 @@ int run_client(const Options& options) {
         return 1;
     }
 
+    std::atomic_bool reader_ok{true};
+    std::thread reader{[&] { read_trading_events(fd, reader_ok); }};
+
     std::string line;
     std::uint64_t seq = 1;
     while (std::getline(std::cin, line)) {
@@ -248,7 +251,9 @@ int run_client(const Options& options) {
         }
 
         const auto bytes = ob::codec::encode_inbound(parsed.value);
-        if (!write_all(fd, bytes) || !read_command_response(fd)) {
+        if (!reader_ok.load(std::memory_order_acquire) || !write_all(fd, bytes)) {
+            (void)::shutdown(fd, SHUT_RDWR);
+            reader.join();
             ::close(fd);
             return 1;
         }
@@ -258,8 +263,9 @@ int run_client(const Options& options) {
     // EOF on stdin means no more commands. Closing the write side lets the
     // server push StopEngine internally, flush responses, and close cleanly.
     (void)::shutdown(fd, SHUT_WR);
+    reader.join();
     ::close(fd);
-    return 0;
+    return reader_ok.load(std::memory_order_acquire) ? 0 : 1;
 }
 
 }  // namespace
