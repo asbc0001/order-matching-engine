@@ -121,6 +121,16 @@ Start the server:
 build/debug/tools/tcp_server 9001 --clients 2 --yield
 ```
 
+By default the server listens only on `127.0.0.1`. To accept connections from
+other machines, bind explicitly:
+
+```bash
+build/debug/tools/tcp_server 9001 --bind 0.0.0.0 --clients 2 --yield
+```
+
+Use external binding only on a trusted network. This development server has no
+authentication or TLS.
+
 In another terminal, watch public L2 market-data updates:
 
 ```bash
@@ -142,9 +152,26 @@ MARKET BID 2
 ```
 
 Normal client mode prints private execution responses such as `AckNew`, `Fill`,
-or `Reject`. Spectator mode sends `SPECTATOR` once, then prints L2 text lines
-such as:
+or `Reject`. Spectator mode sends `SPECTATOR` once, prints the current L2
+snapshot, then prints live L2 update lines such as:
 
 ```text
+SNAPSHOT_BEGIN
+SNAPSHOT_END
 L2 side=Bid price=100 qty=10
 ```
+
+Protocol overview:
+
+- The server binds to `127.0.0.1` by default and assigns a new participant id to
+  each accepted trading connection.
+- Trading clients send fixed-size binary command records; `client` hides that
+  by parsing the text grammar above and encoding each command.
+- Trading clients receive fixed-size binary event records, decoded by `client`
+  into readable `AckNew`, `Fill`, `Reject`, and `AckCancel` lines.
+- Spectator clients send `SPECTATOR` as their first line, then receive a text
+  L2 snapshot followed by live text updates. They do not submit orders.
+- Malformed binary commands close that client connection. Valid rejected orders
+  stay connected and return a `Reject` event.
+- Slow readers are disconnected once their pending response buffer exceeds the
+  configured cap, so one client cannot block the server.

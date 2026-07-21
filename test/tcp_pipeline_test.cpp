@@ -31,6 +31,7 @@ namespace {
 constexpr std::uint16_t kFragmentPort = 19101;
 constexpr std::uint16_t kSlowClientPort = 19102;
 constexpr std::uint16_t kSpectatorPort = 19103;
+constexpr std::uint16_t kSnapshotPort = 19104;
 
 struct ServerProcess {
     pid_t pid{-1};
@@ -214,15 +215,38 @@ bool read_event(int fd, ob::OutboundEvent& event) {
     return true;
 }
 
-bool read_l2_line(int fd, std::string& text) {
+bool read_until_contains(int fd, std::string_view expected) {
+    std::string collected;
     std::array<char, 128> buffer{};
-    const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - 1, 0);
-    if (n <= 0) {
-        return false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - 1, 0);
+        if (n <= 0) {
+            return false;
+        }
+        buffer[static_cast<std::size_t>(n)] = '\0';
+        collected.append(buffer.data(), static_cast<std::size_t>(n));
+        if (collected.find(expected) != std::string::npos) {
+            return true;
+        }
     }
-    buffer[static_cast<std::size_t>(n)] = '\0';
-    text.assign(buffer.data());
-    return true;
+    return false;
+}
+
+bool read_snapshot_containing(int fd, std::string_view expected_level) {
+    std::string collected;
+    std::array<char, 128> buffer{};
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - 1, 0);
+        if (n <= 0) {
+            return false;
+        }
+        buffer[static_cast<std::size_t>(n)] = '\0';
+        collected.append(buffer.data(), static_cast<std::size_t>(n));
+        if (collected.find("SNAPSHOT_END\n") != std::string::npos) {
+            return collected.find(expected_level) != std::string::npos;
+        }
+    }
+    return false;
 }
 
 bool fragmented_record_is_decoded(std::string_view server_path) {
@@ -318,7 +342,11 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     };
     (void)::setsockopt(spectator_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                        sizeof(receive_timeout));
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    if (!read_until_contains(spectator_fd, "SNAPSHOT_END\n")) {
+        std::fprintf(stderr, "spectator did not receive initial snapshot\n");
+        ::close(spectator_fd);
+        return false;
+    }
 
     const int trader_fd = connect_with_retry(kSpectatorPort);
     if (trader_fd < 0) {
@@ -337,10 +365,8 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     }
 
     ob::OutboundEvent bid_ack{};
-    std::string l2_text;
     if (!read_event(trader_fd, bid_ack) || bid_ack.type != ob::EventType::AckNew ||
-        !read_l2_line(spectator_fd, l2_text) ||
-        l2_text.find("L2 side=Bid price=100 qty=1\n") == std::string::npos) {
+        !read_until_contains(spectator_fd, "L2 side=Bid price=100 qty=1\n")) {
         std::fprintf(stderr, "spectator did not receive resting-bid L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -355,8 +381,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     }
     ob::OutboundEvent cancel_ack{};
     if (!read_event(trader_fd, cancel_ack) || cancel_ack.type != ob::EventType::AckCancel ||
-        !read_l2_line(spectator_fd, l2_text) ||
-        l2_text.find("L2 side=Bid price=100 qty=0\n") == std::string::npos) {
+        !read_until_contains(spectator_fd, "L2 side=Bid price=100 qty=0\n")) {
         std::fprintf(stderr, "spectator did not receive cancel L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -371,8 +396,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     }
     ob::OutboundEvent ask_ack{};
     if (!read_event(trader_fd, ask_ack) || ask_ack.type != ob::EventType::AckNew ||
-        !read_l2_line(spectator_fd, l2_text) ||
-        l2_text.find("L2 side=Ask price=105 qty=5\n") == std::string::npos) {
+        !read_until_contains(spectator_fd, "L2 side=Ask price=105 qty=5\n")) {
         std::fprintf(stderr, "spectator did not receive resting-ask L2 update\n");
         ::close(trader_fd);
         ::close(spectator_fd);
@@ -402,8 +426,7 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
     ob::OutboundEvent aggressor_fill{};
     if (!read_event(trader_fd, resting_fill) || !read_event(buyer_fd, aggressor_fill) ||
         resting_fill.type != ob::EventType::Fill || aggressor_fill.type != ob::EventType::Fill ||
-        !read_l2_line(spectator_fd, l2_text) ||
-        l2_text.find("L2 side=Ask price=105 qty=3\n") == std::string::npos) {
+        !read_until_contains(spectator_fd, "L2 side=Ask price=105 qty=3\n")) {
         std::fprintf(stderr, "spectator did not receive fill L2 update\n");
         ::close(buyer_fd);
         ::close(trader_fd);
@@ -417,6 +440,61 @@ bool spectator_receives_l2_updates(std::string_view server_path) {
 
     if (!server.wait_for_exit()) {
         std::fprintf(stderr, "spectator server did not exit cleanly\n");
+        return false;
+    }
+    return true;
+}
+
+bool spectator_receives_existing_depth_snapshot(std::string_view server_path) {
+    auto server = start_server(server_path, kSnapshotPort, 2);
+    const int trader_fd = connect_with_retry(kSnapshotPort);
+    if (trader_fd < 0) {
+        std::fprintf(stderr, "could not connect snapshot trader\n");
+        return false;
+    }
+
+    timeval receive_timeout{
+        .tv_sec = 2,
+        .tv_usec = 0,
+    };
+    (void)::setsockopt(trader_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                       sizeof(receive_timeout));
+
+    if (!send_record(trader_fd, limit_ask(1, 106, 9))) {
+        std::fprintf(stderr, "could not seed snapshot depth\n");
+        ::close(trader_fd);
+        return false;
+    }
+    ob::OutboundEvent ack{};
+    if (!read_event(trader_fd, ack) || ack.type != ob::EventType::AckNew) {
+        std::fprintf(stderr, "snapshot seed order was not accepted\n");
+        ::close(trader_fd);
+        return false;
+    }
+
+    const int spectator_fd = connect_with_retry(kSnapshotPort);
+    if (spectator_fd < 0) {
+        std::fprintf(stderr, "could not connect snapshot spectator\n");
+        ::close(trader_fd);
+        return false;
+    }
+    (void)::setsockopt(spectator_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                       sizeof(receive_timeout));
+
+    constexpr std::string_view handshake = "SPECTATOR\n";
+    if (!send_all(spectator_fd, reinterpret_cast<const std::uint8_t*>(handshake.data()),
+                  handshake.size()) ||
+        !read_snapshot_containing(spectator_fd, "SNAPSHOT side=Ask price=106 qty=9\n")) {
+        std::fprintf(stderr, "spectator did not receive existing-depth snapshot\n");
+        ::close(spectator_fd);
+        ::close(trader_fd);
+        return false;
+    }
+
+    ::close(spectator_fd);
+    ::close(trader_fd);
+    if (!server.wait_for_exit()) {
+        std::fprintf(stderr, "snapshot server did not exit cleanly\n");
         return false;
     }
     return true;
@@ -437,6 +515,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!spectator_receives_l2_updates(argv[1])) {
+        return 1;
+    }
+    if (!spectator_receives_existing_depth_snapshot(argv[1])) {
         return 1;
     }
 

@@ -43,6 +43,10 @@ struct ConnectionState {
     std::atomic<bool> read_closed{false};
     std::atomic<bool> closed{false};
 
+    // Set when a client becomes a spectator. The logger consumes this flag and
+    // sends the current L2 state before live updates continue.
+    std::atomic<bool> snapshot_pending{false};
+
     ConnectionState() = default;
 
     ConnectionState(int socket_fd, ParticipantId id)

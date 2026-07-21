@@ -54,6 +54,7 @@ constexpr std::string_view kSpectatorHandshake = "SPECTATOR\n";
 std::atomic_bool shutdown_requested{false};
 
 struct Options {
+    const char* bind_address{"127.0.0.1"};
     std::uint16_t port{kDefaultPort};
     std::size_t clients{kDefaultClientCount};
     ob::WaitMode wait_mode{ob::WaitMode::Spin};
@@ -78,7 +79,7 @@ struct ConnectionTable {
 };
 
 int usage(const char* program) {
-    std::fprintf(stderr, "usage: %s [port] [--clients N] [--yield]\n", program);
+    std::fprintf(stderr, "usage: %s [port] [--bind IPv4] [--clients N] [--yield]\n", program);
     return 2;
 }
 
@@ -105,14 +106,21 @@ bool parse_size(std::string_view text, std::size_t& value) {
     return true;
 }
 
-// Keep the tool deliberately small: one optional port, a client count, and a
-// wait mode that trades CPU burn for friendlier local runs.
+// Keep the tool deliberately small: one optional port, an optional bind
+// address, a client count, and a local-friendly wait mode.
 bool parse_options(int argc, char** argv, Options& options) {
     bool saw_port = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--yield") {
             options.wait_mode = ob::WaitMode::Yield;
+            continue;
+        }
+        if (arg == "--bind") {
+            if (i + 1 >= argc) {
+                return false;
+            }
+            options.bind_address = argv[++i];
             continue;
         }
         if (arg == "--clients") {
@@ -130,9 +138,9 @@ bool parse_options(int argc, char** argv, Options& options) {
     return true;
 }
 
-// Create a loopback-only listener. This keeps the tool local while still using
-// real TCP sockets and the kernel's normal stream behavior.
-int make_listener(std::uint16_t port) {
+// Create the listening socket. Binding defaults to 127.0.0.1; external access
+// requires an explicit --bind address.
+int make_listener(const char* bind_address, std::uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         std::perror("socket");
@@ -148,7 +156,11 @@ int make_listener(std::uint16_t port) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) {
+        std::fprintf(stderr, "bad bind address: %s\n", bind_address);
+        ::close(fd);
+        return -1;
+    }
     addr.sin_port = htons(port);
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         std::perror("bind");
@@ -244,6 +256,7 @@ bool mark_spectator(int epoll_fd, ConnectionTable& table, ob::tcp::ConnectionSta
     std::lock_guard lock{table.mutex};
     connection.role = ob::tcp::ConnectionRole::Spectator;
     connection.read_size = 0;
+    connection.snapshot_pending.store(true, std::memory_order_release);
     if (!connection.read_closed.exchange(true, std::memory_order_acq_rel) &&
         table.active_readers > 0) {
         --table.active_readers;
@@ -626,6 +639,13 @@ bool append_event(ConnectionTable& table, int write_epoll_fd, ob::tcp::Connectio
                         std::span<const std::uint8_t>{bytes.data(), bytes.size()});
 }
 
+bool append_text(ConnectionTable& table, int write_epoll_fd, ob::tcp::ConnectionState& connection,
+                 std::string_view text) {
+    return append_bytes(table, write_epoll_fd, connection,
+                        std::span<const std::uint8_t>{
+                            reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
+}
+
 // Market-data clients receive simple text lines for now. The line reports the
 // new total quantity at the price level changed by this event.
 bool broadcast_l2_line(ConnectionTable& table, int write_epoll_fd, const ob::OutboundEvent& event,
@@ -651,10 +671,62 @@ bool broadcast_l2_line(ConnectionTable& table, int write_epoll_fd, const ob::Out
     }
 
     bool ok = true;
-    const auto bytes = std::span<const std::uint8_t>{
-        reinterpret_cast<const std::uint8_t*>(line.data()), static_cast<std::size_t>(written)};
     for (ob::tcp::ConnectionState* spectator : spectators) {
-        ok = append_bytes(table, write_epoll_fd, *spectator, bytes) && ok;
+        ok = append_text(table, write_epoll_fd, *spectator,
+                         std::string_view{line.data(), static_cast<std::size_t>(written)}) &&
+             ok;
+    }
+    return ok;
+}
+
+// Write the current visible depth for one side of the book.
+bool append_snapshot_side(ConnectionTable& table, int write_epoll_fd,
+                          ob::tcp::ConnectionState& spectator, const ob::L2Book& l2_book,
+                          ob::Side side) {
+    bool ok = true;
+    for (const ob::L2Level& level : l2_book.levels(side)) {
+        std::array<char, 96> line{};
+        const int written = std::snprintf(
+            line.data(), line.size(), "SNAPSHOT side=%s price=%lld qty=%llu\n", ob::side_name(side),
+            static_cast<long long>(level.price), static_cast<unsigned long long>(level.qty));
+        if (written <= 0 || static_cast<std::size_t>(written) >= line.size()) {
+            return false;
+        }
+        ok = append_text(table, write_epoll_fd, spectator,
+                         std::string_view{line.data(), static_cast<std::size_t>(written)}) &&
+             ok;
+    }
+    return ok;
+}
+
+// Send a complete text snapshot to a newly subscribed spectator.
+bool append_l2_snapshot(ConnectionTable& table, int write_epoll_fd,
+                        ob::tcp::ConnectionState& spectator, const ob::L2Book& l2_book) {
+    bool ok = append_text(table, write_epoll_fd, spectator, "SNAPSHOT_BEGIN\n");
+    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Bid) && ok;
+    ok = append_snapshot_side(table, write_epoll_fd, spectator, l2_book, ob::Side::Ask) && ok;
+    ok = append_text(table, write_epoll_fd, spectator, "SNAPSHOT_END\n") && ok;
+    return ok;
+}
+
+// New spectators are marked by the producer, but only the logger has the L2
+// state and write ownership, so it sends snapshots from here.
+bool send_pending_snapshots(ConnectionTable& table, int write_epoll_fd, const ob::L2Book& l2_book) {
+    std::vector<ob::tcp::ConnectionState*> spectators;
+    {
+        std::lock_guard lock{table.mutex};
+        for (auto& [_, connection] : table.by_participant) {
+            if (connection->role == ob::tcp::ConnectionRole::Spectator &&
+                !connection->closed.load(std::memory_order_acquire) &&
+                connection->snapshot_pending.exchange(false, std::memory_order_acq_rel)) {
+                spectators.push_back(connection.get());
+            }
+        }
+    }
+
+    bool ok = true;
+    for (ob::tcp::ConnectionState* spectator : spectators) {
+        ok = append_l2_snapshot(table, write_epoll_fd, *spectator, l2_book) && ok;
     }
     return ok;
 }
@@ -780,6 +852,7 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
     bool ok = true;
     for (;;) {
         if (!outbound.pop(event)) {
+            ok = send_pending_snapshots(table, write_epoll_fd, l2_book) && ok;
             ok = flush_writable_clients(table, write_epoll_fd) && ok;
             close_drained_readers(table, write_epoll_fd);
             continue;
@@ -796,6 +869,7 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
         const bool publish_l2 = changes_l2(event);
         if (publish_l2) {
             l2_book.apply(event);
+            ok = send_pending_snapshots(table, write_epoll_fd, l2_book) && ok;
             ok = broadcast_l2_line(table, write_epoll_fd, event, l2_book) && ok;
         }
 
@@ -815,11 +889,12 @@ int run_server(const Options& options) {
     ::signal(SIGPIPE, SIG_IGN);
     ::signal(SIGINT, request_shutdown);
 
-    const int listen_fd = make_listener(options.port);
+    const int listen_fd = make_listener(options.bind_address, options.port);
     if (listen_fd < 0) {
         return 1;
     }
-    std::printf("listening on 127.0.0.1:%u for %zu client(s)\n", options.port, options.clients);
+    std::printf("listening on %s:%u for %zu client(s)\n", options.bind_address, options.port,
+                options.clients);
 
     auto inbound = std::make_unique<InboundRing>();
     auto outbound = std::make_unique<OutboundRing>();

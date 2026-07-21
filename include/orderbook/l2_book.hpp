@@ -69,6 +69,24 @@ class L2Book {
         return result;
     }
 
+    [[nodiscard]] std::vector<L2Level> levels(Side side) const {
+        const auto& levels = side == Side::Bid ? bids_ : asks_;
+        std::vector<L2Level> result;
+        result.reserve(levels.size());
+
+        if (side == Side::Bid) {
+            for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) {
+                result.push_back(L2Level{.price = it->first, .qty = it->second});
+            }
+            return result;
+        }
+
+        for (const auto& [price, qty] : asks_) {
+            result.push_back(L2Level{.price = price, .qty = qty});
+        }
+        return result;
+    }
+
   private:
     void add_level_qty(Side side, Price price, Qty qty) {
         auto& levels = side == Side::Bid ? bids_ : asks_;
