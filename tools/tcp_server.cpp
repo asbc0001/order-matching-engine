@@ -5,6 +5,7 @@
 // socket, runs the existing matcher pipeline, and sends fixed-size event records
 // back to the participant that owns each event.
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -28,6 +29,8 @@
 
 #include "orderbook/codec.hpp"
 #include "orderbook/config.hpp"
+#include "orderbook/event_logger.hpp"
+#include "orderbook/l2_book.hpp"
 #include "orderbook/matching_loop.hpp"
 #include "orderbook/spsc_ring.hpp"
 #include "orderbook/tcp/connection.hpp"
@@ -46,6 +49,7 @@ constexpr std::size_t kDefaultClientCount = 1;
 constexpr int kEpollEvents = 16;
 constexpr int kProducerPollMillis = 100;
 constexpr std::uint64_t kShutdownFlushNanos = 500'000'000;
+constexpr std::string_view kSpectatorHandshake = "SPECTATOR\n";
 
 std::atomic_bool shutdown_requested{false};
 
@@ -62,7 +66,7 @@ void request_shutdown(int) noexcept {
 }
 
 // The table has two views of the same connections:
-//   fd -> participant_id for the producer read path
+//   fd -> participant_id for producer reads and logger write-ready events
 //   participant_id -> connection for the logger response path
 struct ConnectionTable {
     std::mutex mutex;
@@ -78,6 +82,7 @@ int usage(const char* program) {
     return 2;
 }
 
+// Parse a TCP port without accepting trailing text such as "9001abc".
 bool parse_u16(std::string_view text, std::uint16_t& value) {
     unsigned parsed = 0;
     char tail = '\0';
@@ -89,6 +94,7 @@ bool parse_u16(std::string_view text, std::uint16_t& value) {
     return true;
 }
 
+// Parse a positive count used for options like --clients.
 bool parse_size(std::string_view text, std::size_t& value) {
     unsigned long long parsed = 0;
     char tail = '\0';
@@ -99,6 +105,8 @@ bool parse_size(std::string_view text, std::size_t& value) {
     return true;
 }
 
+// Keep the tool deliberately small: one optional port, a client count, and a
+// wait mode that trades CPU burn for friendlier local runs.
 bool parse_options(int argc, char** argv, Options& options) {
     bool saw_port = false;
     for (int i = 1; i < argc; ++i) {
@@ -155,6 +163,7 @@ int make_listener(std::uint16_t port) {
     return fd;
 }
 
+// Register an fd for readable events in the producer's epoll set.
 bool add_epoll_in(int epoll_fd, int fd) {
     epoll_event event{};
     event.events = EPOLLIN;
@@ -177,6 +186,8 @@ void push_command(InboundRing& inbound, const ob::InboundMsg& input,
     }
 }
 
+// Stop the engine by sending the same internal command a normal producer uses
+// at EOF. The matcher then emits StopEngine on its usual outbound path.
 void push_stop(InboundRing& inbound, ob::WaitMode wait_mode) noexcept {
     const std::uint64_t now = ob::engine_time_nanos();
     push_command(inbound,
@@ -225,11 +236,31 @@ bool mark_read_closed(int epoll_fd, ConnectionTable& table, int fd) {
     return table.accepting_done && table.active_readers == 0;
 }
 
+// A spectator reads market data only. After the handshake, the producer stops
+// watching it for input but leaves the fd known so the logger can write to it.
+bool mark_spectator(int epoll_fd, ConnectionTable& table, ob::tcp::ConnectionState& connection) {
+    (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection.fd, nullptr);
+
+    std::lock_guard lock{table.mutex};
+    connection.role = ob::tcp::ConnectionRole::Spectator;
+    connection.read_size = 0;
+    if (!connection.read_closed.exchange(true, std::memory_order_acq_rel) &&
+        table.active_readers > 0) {
+        --table.active_readers;
+    }
+    std::printf("client participant=%u is spectator\n", connection.participant_id);
+    return table.accepting_done && table.active_readers == 0;
+}
+
+// The producer can exit once accepting is closed and every trading client has
+// either disconnected or become a spectator.
 bool all_readers_finished(ConnectionTable& table) {
     std::lock_guard lock{table.mutex};
     return table.accepting_done && table.active_readers == 0;
 }
 
+// Disable Nagle's algorithm so small responses are sent promptly during local
+// interactive runs.
 bool set_tcp_nodelay(int fd) {
     const int yes = 1;
     if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) != 0) {
@@ -239,6 +270,7 @@ bool set_tcp_nodelay(int fd) {
     return true;
 }
 
+// Store a newly accepted socket in both routing maps.
 bool add_client(ConnectionTable& table, int client_fd, ob::ParticipantId participant_id) {
     auto connection = std::make_unique<ob::tcp::ConnectionState>(client_fd, participant_id);
 
@@ -250,6 +282,7 @@ bool add_client(ConnectionTable& table, int client_fd, ob::ParticipantId partici
     return true;
 }
 
+// Stop listening for new clients. Existing clients may still drain normally.
 void stop_accepting(int epoll_fd, int listen_fd, ConnectionTable& table) {
     (void)::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listen_fd, nullptr);
     std::lock_guard lock{table.mutex};
@@ -332,6 +365,26 @@ bool decode_buffered_commands(ob::tcp::ConnectionState& connection, InboundRing&
     return true;
 }
 
+// Detect the optional read-only client handshake. Anything else falls through
+// to normal binary command decoding.
+bool try_read_spectator_handshake(int epoll_fd, ConnectionTable& table,
+                                  ob::tcp::ConnectionState& connection, bool& all_clients_closed) {
+    if (connection.read_size > kSpectatorHandshake.size()) {
+        return false;
+    }
+    const std::string_view buffered{reinterpret_cast<const char*>(connection.read_buf.data()),
+                                    connection.read_size};
+    if (kSpectatorHandshake.substr(0, buffered.size()) != buffered) {
+        return false;
+    }
+    if (buffered.size() != kSpectatorHandshake.size()) {
+        return true;
+    }
+
+    all_clients_closed = mark_spectator(epoll_fd, table, connection);
+    return true;
+}
+
 // Drain the currently-readable bytes for one client. Level-triggered epoll will
 // wake us again if more bytes remain later.
 bool read_client_commands(int epoll_fd, ConnectionTable& table, int fd, InboundRing& inbound,
@@ -350,6 +403,9 @@ bool read_client_commands(int epoll_fd, ConnectionTable& table, int fd, InboundR
                                  connection->read_buf.size() - connection->read_size, 0);
         if (n > 0) {
             connection->read_size += static_cast<std::size_t>(n);
+            if (try_read_spectator_handshake(epoll_fd, table, *connection, all_clients_closed)) {
+                return true;
+            }
             if (!decode_buffered_commands(*connection, inbound, wait_mode)) {
                 all_clients_closed = mark_read_closed(epoll_fd, table, fd);
                 return false;
@@ -433,6 +489,7 @@ bool run_producer(int listen_fd, ConnectionTable& table, InboundRing& inbound,
     return ok;
 }
 
+// Find a still-open trading client for a private matcher response.
 ob::tcp::ConnectionState* connection_for_participant(ConnectionTable& table,
                                                      ob::ParticipantId participant_id) {
     std::lock_guard lock{table.mutex};
@@ -444,6 +501,8 @@ ob::tcp::ConnectionState* connection_for_participant(ConnectionTable& table,
     return found->second.get();
 }
 
+// Start watching a client only when it has buffered bytes that could not be
+// written immediately.
 bool add_epoll_out(int epoll_fd, ob::tcp::ConnectionState& connection) {
     if (connection.write_registered) {
         return true;
@@ -460,6 +519,7 @@ bool add_epoll_out(int epoll_fd, ob::tcp::ConnectionState& connection) {
     return true;
 }
 
+// Stop write-ready notifications once the client's pending buffer is empty.
 bool remove_epoll_out(int epoll_fd, ob::tcp::ConnectionState& connection) {
     if (!connection.write_registered) {
         return true;
@@ -524,8 +584,10 @@ bool flush_client(ConnectionTable& table, int write_epoll_fd,
     return remove_epoll_out(write_epoll_fd, connection);
 }
 
-bool append_event(ConnectionTable& table, int write_epoll_fd, ob::tcp::ConnectionState& connection,
-                  const ob::codec::EncodedOutbound& bytes) {
+// Queue bytes for one client and try to write them immediately. If the client
+// falls too far behind, close it so memory use stays bounded.
+bool append_bytes(ConnectionTable& table, int write_epoll_fd, ob::tcp::ConnectionState& connection,
+                  std::span<const std::uint8_t> bytes) {
     if (connection.closed.load(std::memory_order_acquire)) {
         return true;
     }
@@ -550,6 +612,53 @@ bool append_event(ConnectionTable& table, int write_epoll_fd, ob::tcp::Connectio
     return flush_client(table, write_epoll_fd, connection);
 }
 
+// Private execution reports use the fixed-size binary event codec.
+bool append_event(ConnectionTable& table, int write_epoll_fd, ob::tcp::ConnectionState& connection,
+                  const ob::codec::EncodedOutbound& bytes) {
+    return append_bytes(table, write_epoll_fd, connection,
+                        std::span<const std::uint8_t>{bytes.data(), bytes.size()});
+}
+
+// Market-data clients receive simple text lines for now. The line reports the
+// new total quantity at the price level changed by this event.
+bool broadcast_l2_line(ConnectionTable& table, int write_epoll_fd, const ob::OutboundEvent& event,
+                       const ob::L2Book& l2_book) {
+    std::array<char, 96> line{};
+    const int written = std::snprintf(
+        line.data(), line.size(), "L2 side=%s price=%lld qty=%llu\n", ob::side_name(event.side),
+        static_cast<long long>(event.price),
+        static_cast<unsigned long long>(l2_book.quantity_at(event.side, event.price)));
+    if (written <= 0 || static_cast<std::size_t>(written) >= line.size()) {
+        return false;
+    }
+
+    std::vector<ob::tcp::ConnectionState*> spectators;
+    {
+        std::lock_guard lock{table.mutex};
+        for (auto& [_, connection] : table.by_participant) {
+            if (connection->role == ob::tcp::ConnectionRole::Spectator &&
+                !connection->closed.load(std::memory_order_acquire)) {
+                spectators.push_back(connection.get());
+            }
+        }
+    }
+
+    bool ok = true;
+    const auto bytes = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(line.data()), static_cast<std::size_t>(written)};
+    for (ob::tcp::ConnectionState* spectator : spectators) {
+        ok = append_bytes(table, write_epoll_fd, *spectator, bytes) && ok;
+    }
+    return ok;
+}
+
+// Only events that change resting visible quantity should publish L2 updates.
+bool changes_l2(const ob::OutboundEvent& event) noexcept {
+    return event.type == ob::EventType::AckNew || event.type == ob::EventType::AckCancel ||
+           (event.type == ob::EventType::Fill && event.handle != 0);
+}
+
+// EPOLLOUT reports only an fd, so look it back up before flushing bytes.
 ob::tcp::ConnectionState* connection_for_write_fd(ConnectionTable& table, int fd) {
     std::lock_guard lock{table.mutex};
     const auto id = table.participant_by_fd.find(fd);
@@ -560,6 +669,9 @@ ob::tcp::ConnectionState* connection_for_write_fd(ConnectionTable& table, int fd
     return connection == table.by_participant.end() ? nullptr : connection->second.get();
 }
 
+// Trading clients close after their reads end and pending replies drain.
+// Spectators are write-only after their handshake, so read_closed is normal for
+// them and does not mean their socket should be closed.
 void close_drained_readers(ConnectionTable& table, int write_epoll_fd) {
     for (;;) {
         ob::tcp::ConnectionState* to_close = nullptr;
@@ -567,6 +679,7 @@ void close_drained_readers(ConnectionTable& table, int write_epoll_fd) {
             std::lock_guard lock{table.mutex};
             for (auto& [_, connection] : table.by_participant) {
                 if (connection->read_closed.load(std::memory_order_acquire) &&
+                    connection->role != ob::tcp::ConnectionRole::Spectator &&
                     connection->write_buf.empty() &&
                     !connection->closed.load(std::memory_order_acquire)) {
                     to_close = connection.get();
@@ -582,6 +695,7 @@ void close_drained_readers(ConnectionTable& table, int write_epoll_fd) {
     }
 }
 
+// Service clients whose sockets are ready for more outgoing bytes.
 bool flush_writable_clients(ConnectionTable& table, int write_epoll_fd) {
     epoll_event events[kEpollEvents]{};
     const int count = ::epoll_wait(write_epoll_fd, events, kEpollEvents, 1);
@@ -604,6 +718,7 @@ bool flush_writable_clients(ConnectionTable& table, int write_epoll_fd) {
     return ok;
 }
 
+// Used during shutdown to decide whether a brief final flush is still useful.
 bool has_pending_writes(ConnectionTable& table) {
     std::lock_guard lock{table.mutex};
     for (const auto& [_, connection] : table.by_participant) {
@@ -627,6 +742,8 @@ bool flush_before_shutdown(ConnectionTable& table, int write_epoll_fd) {
     return ok;
 }
 
+// Close every socket from the logger side. Called only after StopEngine, when
+// no more private events or L2 updates will be generated.
 void close_all_clients(ConnectionTable& table, int write_epoll_fd) {
     std::vector<ob::tcp::ConnectionState*> connections;
     {
@@ -642,6 +759,8 @@ void close_all_clients(ConnectionTable& table, int write_epoll_fd) {
     }
 }
 
+// Logger thread: route private binary events to traders and publish L2 text
+// updates to spectators. It owns all socket writes and closes.
 bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
     const int write_epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
     if (write_epoll_fd < 0) {
@@ -650,6 +769,7 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
     }
 
     ob::OutboundEvent event{};
+    ob::L2Book l2_book;
     bool ok = true;
     for (;;) {
         if (!outbound.pop(event)) {
@@ -664,6 +784,12 @@ bool run_logger(OutboundRing& outbound, ConnectionTable& table) {
             close_all_clients(table, write_epoll_fd);
             ::close(write_epoll_fd);
             return ok;
+        }
+
+        const bool publish_l2 = changes_l2(event);
+        if (publish_l2) {
+            l2_book.apply(event);
+            ok = broadcast_l2_line(table, write_epoll_fd, event, l2_book) && ok;
         }
 
         ob::tcp::ConnectionState* connection =

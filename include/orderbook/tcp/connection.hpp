@@ -17,9 +17,15 @@
 
 namespace ob::tcp {
 
+enum class ConnectionRole : std::uint8_t {
+    Trader,
+    Spectator,
+};
+
 struct ConnectionState {
     int fd{-1};
     ParticipantId participant_id{0};
+    ConnectionRole role{ConnectionRole::Trader};
 
     // Producer-owned buffer. It keeps partial fixed-size command records until
     // enough bytes have arrived for codec decoding.

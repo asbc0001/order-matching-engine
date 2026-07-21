@@ -44,6 +44,10 @@ add_executable(event_logger_test event_logger_test.cpp)
 target_link_libraries(event_logger_test PRIVATE orderbook_core)
 add_test(NAME event_logger_test COMMAND event_logger_test)
 
+add_executable(l2_book_test l2_book_test.cpp)
+target_link_libraries(l2_book_test PRIVATE orderbook_core)
+add_test(NAME l2_book_test COMMAND l2_book_test)
+
 add_executable(demo_renderer_test demo_renderer_test.cpp)
 target_link_libraries(demo_renderer_test PRIVATE orderbook_core)
 add_test(NAME demo_renderer_test COMMAND demo_renderer_test)

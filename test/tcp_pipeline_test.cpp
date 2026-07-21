@@ -30,6 +30,7 @@ namespace {
 
 constexpr std::uint16_t kFragmentPort = 19101;
 constexpr std::uint16_t kSlowClientPort = 19102;
+constexpr std::uint16_t kSpectatorPort = 19103;
 
 struct ServerProcess {
     pid_t pid{-1};
@@ -101,13 +102,15 @@ bool recv_all(int fd, std::uint8_t* data, std::size_t size) {
     return true;
 }
 
-ServerProcess start_server(std::string_view server_path, std::uint16_t port) {
+ServerProcess start_server(std::string_view server_path, std::uint16_t port,
+                           std::size_t clients = 1) {
     ServerProcess server;
     server.pid = ::fork();
     if (server.pid == 0) {
         const std::string port_text = std::to_string(port);
-        ::execl(server_path.data(), server_path.data(), port_text.c_str(), "--clients", "1",
-                "--yield", static_cast<char*>(nullptr));
+        const std::string clients_text = std::to_string(clients);
+        ::execl(server_path.data(), server_path.data(), port_text.c_str(), "--clients",
+                clients_text.c_str(), "--yield", static_cast<char*>(nullptr));
         std::_Exit(127);
     }
     return server;
@@ -150,6 +153,76 @@ ob::codec::EncodedInbound limit_bid(std::uint64_t client_seq) {
         .tsc_ready = 0,
         .tsc_enqueue = 0,
     });
+}
+
+ob::codec::EncodedInbound limit_ask(std::uint64_t client_seq, ob::Price price, ob::Qty qty) {
+    return ob::codec::encode_inbound(ob::InboundMsg{
+        .client_seq = client_seq,
+        .handle = 0,
+        .price = price,
+        .qty = qty,
+        .side = ob::Side::Ask,
+        .type = ob::MsgType::NewLimit,
+        .tsc_intended = 0,
+        .tsc_ready = 0,
+        .tsc_enqueue = 0,
+    });
+}
+
+ob::codec::EncodedInbound market_bid(std::uint64_t client_seq, ob::Qty qty) {
+    return ob::codec::encode_inbound(ob::InboundMsg{
+        .client_seq = client_seq,
+        .handle = 0,
+        .price = 0,
+        .qty = qty,
+        .side = ob::Side::Bid,
+        .type = ob::MsgType::NewMarket,
+        .tsc_intended = 0,
+        .tsc_ready = 0,
+        .tsc_enqueue = 0,
+    });
+}
+
+ob::codec::EncodedInbound cancel_order(std::uint64_t client_seq, ob::Handle handle) {
+    return ob::codec::encode_inbound(ob::InboundMsg{
+        .client_seq = client_seq,
+        .handle = handle,
+        .price = 0,
+        .qty = 0,
+        .side = ob::Side::Bid,
+        .type = ob::MsgType::Cancel,
+        .tsc_intended = 0,
+        .tsc_ready = 0,
+        .tsc_enqueue = 0,
+    });
+}
+
+bool send_record(int fd, const ob::codec::EncodedInbound& record) {
+    return send_all(fd, record.data(), record.size());
+}
+
+bool read_event(int fd, ob::OutboundEvent& event) {
+    ob::codec::EncodedOutbound encoded{};
+    if (!recv_all(fd, encoded.data(), encoded.size())) {
+        return false;
+    }
+    const auto decoded = ob::codec::decode_outbound(encoded);
+    if (!decoded) {
+        return false;
+    }
+    event = decoded.value;
+    return true;
+}
+
+bool read_l2_line(int fd, std::string& text) {
+    std::array<char, 128> buffer{};
+    const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - 1, 0);
+    if (n <= 0) {
+        return false;
+    }
+    buffer[static_cast<std::size_t>(n)] = '\0';
+    text.assign(buffer.data());
+    return true;
 }
 
 bool fragmented_record_is_decoded(std::string_view server_path) {
@@ -222,6 +295,133 @@ bool slow_client_is_disconnected(std::string_view server_path) {
     return true;
 }
 
+bool spectator_receives_l2_updates(std::string_view server_path) {
+    // Three clients: one market-data spectator, one resting trader, and one
+    // crossing trader so the fill is not blocked by self-trade prevention.
+    auto server = start_server(server_path, kSpectatorPort, 3);
+    const int spectator_fd = connect_with_retry(kSpectatorPort);
+    if (spectator_fd < 0) {
+        std::fprintf(stderr, "could not connect spectator\n");
+        return false;
+    }
+
+    constexpr std::string_view handshake = "SPECTATOR\n";
+    if (!send_all(spectator_fd, reinterpret_cast<const std::uint8_t*>(handshake.data()),
+                  handshake.size())) {
+        std::fprintf(stderr, "could not send spectator handshake\n");
+        ::close(spectator_fd);
+        return false;
+    }
+    timeval receive_timeout{
+        .tv_sec = 2,
+        .tv_usec = 0,
+    };
+    (void)::setsockopt(spectator_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                       sizeof(receive_timeout));
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+    const int trader_fd = connect_with_retry(kSpectatorPort);
+    if (trader_fd < 0) {
+        std::fprintf(stderr, "could not connect trader\n");
+        ::close(spectator_fd);
+        return false;
+    }
+    (void)::setsockopt(trader_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                       sizeof(receive_timeout));
+
+    if (!send_record(trader_fd, limit_bid(1))) {
+        std::fprintf(stderr, "could not send resting bid\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+
+    ob::OutboundEvent bid_ack{};
+    std::string l2_text;
+    if (!read_event(trader_fd, bid_ack) || bid_ack.type != ob::EventType::AckNew ||
+        !read_l2_line(spectator_fd, l2_text) ||
+        l2_text.find("L2 side=Bid price=100 qty=1\n") == std::string::npos) {
+        std::fprintf(stderr, "spectator did not receive resting-bid L2 update\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+
+    if (!send_record(trader_fd, cancel_order(2, bid_ack.handle))) {
+        std::fprintf(stderr, "could not send cancel\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+    ob::OutboundEvent cancel_ack{};
+    if (!read_event(trader_fd, cancel_ack) || cancel_ack.type != ob::EventType::AckCancel ||
+        !read_l2_line(spectator_fd, l2_text) ||
+        l2_text.find("L2 side=Bid price=100 qty=0\n") == std::string::npos) {
+        std::fprintf(stderr, "spectator did not receive cancel L2 update\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+
+    if (!send_record(trader_fd, limit_ask(3, 105, 5))) {
+        std::fprintf(stderr, "could not send resting ask\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+    ob::OutboundEvent ask_ack{};
+    if (!read_event(trader_fd, ask_ack) || ask_ack.type != ob::EventType::AckNew ||
+        !read_l2_line(spectator_fd, l2_text) ||
+        l2_text.find("L2 side=Ask price=105 qty=5\n") == std::string::npos) {
+        std::fprintf(stderr, "spectator did not receive resting-ask L2 update\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+
+    // Use a second trader for the market buy. The server assigns participant
+    // ids per connection, so one socket trading with itself would be rejected.
+    const int buyer_fd = connect_with_retry(kSpectatorPort);
+    if (buyer_fd < 0) {
+        std::fprintf(stderr, "could not connect buyer\n");
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+    (void)::setsockopt(buyer_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                       sizeof(receive_timeout));
+
+    if (!send_record(buyer_fd, market_bid(4, 2))) {
+        std::fprintf(stderr, "could not send crossing market order\n");
+        ::close(buyer_fd);
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+    ob::OutboundEvent resting_fill{};
+    ob::OutboundEvent aggressor_fill{};
+    if (!read_event(trader_fd, resting_fill) || !read_event(buyer_fd, aggressor_fill) ||
+        resting_fill.type != ob::EventType::Fill || aggressor_fill.type != ob::EventType::Fill ||
+        !read_l2_line(spectator_fd, l2_text) ||
+        l2_text.find("L2 side=Ask price=105 qty=3\n") == std::string::npos) {
+        std::fprintf(stderr, "spectator did not receive fill L2 update\n");
+        ::close(buyer_fd);
+        ::close(trader_fd);
+        ::close(spectator_fd);
+        return false;
+    }
+
+    ::close(buyer_fd);
+    ::close(trader_fd);
+    ::close(spectator_fd);
+
+    if (!server.wait_for_exit()) {
+        std::fprintf(stderr, "spectator server did not exit cleanly\n");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -234,6 +434,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!slow_client_is_disconnected(argv[1])) {
+        return 1;
+    }
+    if (!spectator_receives_l2_updates(argv[1])) {
         return 1;
     }
 
